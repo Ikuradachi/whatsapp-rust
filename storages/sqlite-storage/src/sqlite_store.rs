@@ -2552,6 +2552,58 @@ impl MsgSecretStore for SqliteStore {
         .await
     }
 
+    async fn put_msg_secrets(&self, entries: Vec<MsgSecretEntry>) -> Result<usize> {
+        if entries.is_empty() {
+            return Ok(0);
+        }
+
+        let device_id = self.device_id;
+        let entries: Arc<[MsgSecretEntry]> = Arc::from(entries);
+        let now = wacore::time::now_secs();
+        self.with_retry("put_msg_secrets", || {
+            let entries = Arc::clone(&entries);
+            Box::new(move |conn: &mut SqliteConnection| {
+                let records: Vec<_> = entries
+                    .iter()
+                    .map(|entry| {
+                        (
+                            msg_secrets::chat.eq(entry.chat.as_str()),
+                            msg_secrets::sender.eq(entry.sender.as_str()),
+                            msg_secrets::msg_id.eq(entry.msg_id.as_str()),
+                            msg_secrets::secret.eq(entry.secret.as_slice()),
+                            msg_secrets::device_id.eq(device_id),
+                            msg_secrets::created_at.eq(now),
+                        )
+                    })
+                    .collect();
+
+                const CHUNK_SIZE: usize = 100;
+
+                conn.immediate_transaction(|conn| {
+                    let mut stored = 0usize;
+                    for chunk in records.chunks(CHUNK_SIZE) {
+                        stored += diesel::insert_into(msg_secrets::table)
+                            .values(chunk)
+                            .on_conflict((
+                                msg_secrets::chat,
+                                msg_secrets::sender,
+                                msg_secrets::msg_id,
+                                msg_secrets::device_id,
+                            ))
+                            .do_update()
+                            .set((
+                                msg_secrets::secret.eq(excluded(msg_secrets::secret)),
+                                msg_secrets::created_at.eq(excluded(msg_secrets::created_at)),
+                            ))
+                            .execute(conn)?;
+                    }
+                    Ok(stored)
+                })
+            })
+        })
+        .await
+    }
+
     async fn get_msg_secret(
         &self,
         chat: &str,
@@ -3267,6 +3319,44 @@ mod tests {
                 .unwrap_or_else(|| panic!("missing ({chat},{sender},{msg_id})"));
             assert_eq!(got, vec![expected; 32]);
         }
+    }
+
+    #[tokio::test]
+    async fn msg_secret_batch_upserts_in_one_call() {
+        let store = create_test_store().await;
+        let stored = store
+            .put_msg_secrets(vec![
+                MsgSecretEntry {
+                    chat: "c".into(),
+                    sender: "s".into(),
+                    msg_id: "M1".into(),
+                    secret: vec![1u8; 32],
+                },
+                MsgSecretEntry {
+                    chat: "c".into(),
+                    sender: "s".into(),
+                    msg_id: "M2".into(),
+                    secret: vec![2u8; 32],
+                },
+                MsgSecretEntry {
+                    chat: "c".into(),
+                    sender: "s".into(),
+                    msg_id: "M1".into(),
+                    secret: vec![9u8; 32],
+                },
+            ])
+            .await
+            .unwrap();
+
+        assert_eq!(stored, 3);
+        assert_eq!(
+            store.get_msg_secret("c", "s", "M1").await.unwrap().unwrap(),
+            vec![9u8; 32]
+        );
+        assert_eq!(
+            store.get_msg_secret("c", "s", "M2").await.unwrap().unwrap(),
+            vec![2u8; 32]
+        );
     }
 
     #[tokio::test]
