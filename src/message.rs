@@ -1189,9 +1189,10 @@ impl Client {
 
         if retry_count > HIGH_RETRY_COUNT_THRESHOLD {
             log::warn!(
-                "High retry count ({}) for message {} from {} [{:?}]",
+                "High retry count ({}) for message {} in chat {} from {} [{:?}]",
                 retry_count,
                 info.id,
+                info.source.chat,
                 info.source.sender,
                 reason
             );
@@ -1200,8 +1201,8 @@ impl Client {
         let retry_sent = match self.send_retry_receipt(info, retry_count, reason).await {
             Ok(()) => {
                 debug!(
-                    "Sent retry receipt #{} for message {} from {} [{:?}]",
-                    retry_count, info.id, info.source.sender, reason
+                    "Sent retry receipt #{} for message {} in chat {} from {} [{:?}]",
+                    retry_count, info.id, info.source.chat, info.source.sender, reason
                 );
                 true
             }
