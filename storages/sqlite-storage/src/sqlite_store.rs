@@ -263,6 +263,15 @@ impl SqliteStore {
                     if is_retriable_sqlite_error(e) && attempt < MAX_RETRIES =>
                 {
                     let delay_ms = 10u64 * (1u64 << attempt.min(4));
+                    // Skip the first transient blip; warn from the second retry on so
+                    // sustained busy/locked contention doesn't go unobserved.
+                    if attempt >= 1 {
+                        warn!(
+                            "{op_name} busy/locked, retry {}/{} in {delay_ms}ms: {e}",
+                            attempt + 1,
+                            MAX_RETRIES + 1
+                        );
+                    }
                     tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
                 }
                 Ok(Err(e)) => return Err(e.into()),
@@ -1261,6 +1270,38 @@ impl SignalStore for SqliteStore {
             .await
     }
 
+    async fn put_identities_batch(&self, identities: &[(Arc<str>, [u8; 32])]) -> Result<()> {
+        if identities.is_empty() {
+            return Ok(());
+        }
+
+        let device_id = self.device_id;
+        // `Arc<Vec>` so each retry attempt bumps a refcount instead of re-cloning
+        // the whole batch.
+        let batch = Arc::new(identities.to_vec());
+        self.with_retry("put_identities_batch", || {
+            let batch = batch.clone();
+            Box::new(move |conn: &mut SqliteConnection| {
+                conn.transaction(|conn| {
+                    for (address, key) in batch.iter() {
+                        diesel::insert_into(identities::table)
+                            .values((
+                                identities::address.eq(address.as_ref()),
+                                identities::key.eq(&key[..]),
+                                identities::device_id.eq(device_id),
+                            ))
+                            .on_conflict((identities::address, identities::device_id))
+                            .do_update()
+                            .set(identities::key.eq(&key[..]))
+                            .execute(conn)?;
+                    }
+                    Ok(())
+                })
+            })
+        })
+        .await
+    }
+
     async fn load_identity(&self, address: &str) -> Result<Option<[u8; 32]>> {
         let blob = self
             .load_identity_for_device(address, self.device_id)
@@ -1353,6 +1394,36 @@ impl SignalStore for SqliteStore {
     async fn put_session(&self, address: &str, session: &[u8]) -> Result<()> {
         self.put_session_for_device(address, session, self.device_id)
             .await
+    }
+
+    async fn put_sessions_batch(&self, sessions: &[(Arc<str>, Bytes)]) -> Result<()> {
+        if sessions.is_empty() {
+            return Ok(());
+        }
+
+        let device_id = self.device_id;
+        let batch = Arc::new(sessions.to_vec());
+        self.with_retry("put_sessions_batch", || {
+            let batch = batch.clone();
+            Box::new(move |conn: &mut SqliteConnection| {
+                conn.transaction(|conn| {
+                    for (address, record) in batch.iter() {
+                        diesel::insert_into(sessions::table)
+                            .values((
+                                sessions::address.eq(address.as_ref()),
+                                sessions::record.eq(record.as_ref()),
+                                sessions::device_id.eq(device_id),
+                            ))
+                            .on_conflict((sessions::address, sessions::device_id))
+                            .do_update()
+                            .set(sessions::record.eq(record.as_ref()))
+                            .execute(conn)?;
+                    }
+                    Ok(())
+                })
+            })
+        })
+        .await
     }
 
     async fn delete_session(&self, address: &str) -> Result<()> {
@@ -1769,6 +1840,36 @@ impl SignalStore for SqliteStore {
     async fn put_sender_key(&self, address: &str, record: &[u8]) -> Result<()> {
         self.put_sender_key_for_device(address, record, self.device_id)
             .await
+    }
+
+    async fn put_sender_keys_batch(&self, sender_keys: &[(Arc<str>, Bytes)]) -> Result<()> {
+        if sender_keys.is_empty() {
+            return Ok(());
+        }
+
+        let device_id = self.device_id;
+        let batch = Arc::new(sender_keys.to_vec());
+        self.with_retry("put_sender_keys_batch", || {
+            let batch = batch.clone();
+            Box::new(move |conn: &mut SqliteConnection| {
+                conn.transaction(|conn| {
+                    for (address, record) in batch.iter() {
+                        diesel::insert_into(sender_keys::table)
+                            .values((
+                                sender_keys::address.eq(address.as_ref()),
+                                sender_keys::record.eq(record.as_ref()),
+                                sender_keys::device_id.eq(device_id),
+                            ))
+                            .on_conflict((sender_keys::address, sender_keys::device_id))
+                            .do_update()
+                            .set(sender_keys::record.eq(record.as_ref()))
+                            .execute(conn)?;
+                    }
+                    Ok(())
+                })
+            })
+        })
+        .await
     }
 
     async fn get_sender_key(&self, address: &str) -> Result<Option<Vec<u8>>> {
@@ -2965,6 +3066,90 @@ mod tests {
             .await
             .unwrap();
         assert!(empty.is_empty());
+    }
+
+    #[tokio::test]
+    async fn put_signal_batches_persist_and_upsert() {
+        use std::sync::Arc;
+        let store = create_test_store().await;
+
+        let sessions: Vec<(Arc<str>, Bytes)> = (0..5u8)
+            .map(|i| {
+                (
+                    Arc::from(format!("user{i}@s.whatsapp.net").as_str()),
+                    Bytes::from(vec![i; 8]),
+                )
+            })
+            .collect();
+        store.put_sessions_batch(&sessions).await.unwrap();
+        for (addr, bytes) in &sessions {
+            assert_eq!(
+                store.get_session(addr).await.unwrap().as_deref(),
+                Some(bytes.as_ref())
+            );
+        }
+
+        let identities: Vec<(Arc<str>, [u8; 32])> = (0..5u8)
+            .map(|i| {
+                (
+                    Arc::from(format!("user{i}@s.whatsapp.net").as_str()),
+                    [i; 32],
+                )
+            })
+            .collect();
+        store.put_identities_batch(&identities).await.unwrap();
+        for (addr, key) in &identities {
+            assert_eq!(store.load_identity(addr).await.unwrap(), Some(*key));
+        }
+
+        let sender_keys: Vec<(Arc<str>, Bytes)> = (0..5u8)
+            .map(|i| {
+                (
+                    Arc::from(format!("g@g.us::user{i}").as_str()),
+                    Bytes::from(vec![i; 16]),
+                )
+            })
+            .collect();
+        store.put_sender_keys_batch(&sender_keys).await.unwrap();
+        for (addr, bytes) in &sender_keys {
+            assert_eq!(
+                store.get_sender_key(addr).await.unwrap().as_deref(),
+                Some(bytes.as_ref())
+            );
+        }
+
+        // Re-batching the same addresses upserts (on_conflict do_update).
+        let updated: Vec<(Arc<str>, Bytes)> = sessions
+            .iter()
+            .map(|(addr, _)| (addr.clone(), Bytes::from(vec![0xAA; 8])))
+            .collect();
+        store.put_sessions_batch(&updated).await.unwrap();
+        for (addr, _) in &sessions {
+            assert_eq!(
+                store.get_session(addr).await.unwrap().as_deref(),
+                Some([0xAA; 8].as_slice())
+            );
+        }
+
+        // Duplicate address within one batch: last value wins via on_conflict
+        // do_update inside the single transaction.
+        let dup: Arc<str> = Arc::from("dup@s.whatsapp.net");
+        store
+            .put_sessions_batch(&[
+                (dup.clone(), Bytes::from(vec![1u8; 4])),
+                (dup.clone(), Bytes::from(vec![2u8; 4])),
+            ])
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get_session(&dup).await.unwrap().as_deref(),
+            Some([2u8; 4].as_slice())
+        );
+
+        // Empty batches short-circuit without error.
+        store.put_sessions_batch(&[]).await.unwrap();
+        store.put_identities_batch(&[]).await.unwrap();
+        store.put_sender_keys_batch(&[]).await.unwrap();
     }
 
     #[test]
