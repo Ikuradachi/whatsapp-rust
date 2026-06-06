@@ -523,6 +523,9 @@ impl Client {
         let mut session_guard: Option<async_lock::MutexGuardArc<()>> =
             Some(session_mutex.lock_arc().await);
 
+        // Started after the lock so the histogram is crypto-only, not lock/queue wait.
+        let _t = wacore::telemetry::timer(wacore::telemetry::DECRYPT_DURATION);
+
         let mut adapter = self.signal_adapter().await;
         let mut rng = rand::make_rng::<rand::rngs::StdRng>();
         let mut outcome = SessionBatchOutcome::default();

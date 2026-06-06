@@ -415,6 +415,9 @@ async fn handle_identity_change(client: &Arc<Client>, node: &NodeRef<'_>) {
         return;
     }
 
+    // Counted here, past the companion/self/no-prior gates, so it reflects actual
+    // session resets rather than every identity-change push received.
+    wacore::telemetry::identity_change();
     info!(
         "Identity change for {} (had_prior_identity=true): resetting session",
         from_jid.user

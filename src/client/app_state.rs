@@ -62,6 +62,7 @@ impl Client {
     }
 
     async fn fetch_app_state_with_retry_inner(&self, name: WAPatchName) -> anyhow::Result<()> {
+        let _t = wacore::telemetry::timer(wacore::telemetry::APPSTATE_SYNC_DURATION);
         let mut attempt = 0u32;
         loop {
             attempt += 1;
@@ -70,7 +71,10 @@ impl Client {
             // Matches WA Web which only requests snapshot when version is undefined.
             let res = self.process_app_state_sync_task(name, false).await;
             match res {
-                Ok(()) => return Ok(()),
+                Ok(()) => {
+                    wacore::telemetry::appstate_sync("ok");
+                    return Ok(());
+                }
                 Err(e) => {
                     if e.downcast_ref::<crate::appstate_sync::AppStateSyncError>()
                         .is_some_and(|ase| {
@@ -109,6 +113,7 @@ impl Client {
                         self.runtime.sleep(backoff).await;
                         continue;
                     }
+                    wacore::telemetry::appstate_sync("fail");
                     return Err(e);
                 }
             }
@@ -330,6 +335,7 @@ impl Client {
                 // (version was 0 before sync). This prevents server_sync-triggered
                 // incremental syncs from being incorrectly marked as full syncs.
                 let full_sync = was_snapshot.contains(&name);
+                wacore::telemetry::appstate_mutations(mutations.len() as u64);
                 for m in mutations {
                     self.dispatch_app_state_mutation(&m, full_sync).await;
                 }
@@ -516,6 +522,7 @@ impl Client {
             };
             self.request_missing_keys_with_dedup(missing).await;
 
+            wacore::telemetry::appstate_mutations(mutations.len() as u64);
             for m in mutations {
                 debug!(target: "Client/AppState", "Dispatching mutation kind={} index_len={} full_sync={}", m.index.first().map(|s| s.as_str()).unwrap_or(""), m.index.len(), full_sync);
                 self.dispatch_app_state_mutation(&m, full_sync).await;

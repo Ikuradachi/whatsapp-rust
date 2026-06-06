@@ -61,6 +61,28 @@ pub enum RetryReason {
     StatusRevokeDelay = 13,
 }
 
+impl RetryReason {
+    /// Stable, low-cardinality label for metrics and logs.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::UnknownError => "unknown",
+            Self::NoSession => "no_session",
+            Self::InvalidKey => "invalid_key",
+            Self::InvalidKeyId => "invalid_key_id",
+            Self::InvalidMessage => "invalid_message",
+            Self::InvalidSignature => "invalid_signature",
+            Self::FutureMessage => "future_message",
+            Self::BadMac => "bad_mac",
+            Self::InvalidSession => "invalid_session",
+            Self::InvalidMsgKey => "invalid_msg_key",
+            Self::BadBroadcastEphemeralSetting => "bad_broadcast_ephemeral",
+            Self::UnknownCompanionNoPrekey => "unknown_companion",
+            Self::AdvFailure => "adv_failure",
+            Self::StatusRevokeDelay => "status_revoke_delay",
+        }
+    }
+}
+
 /// Helper to extract bytes content from a Node.
 pub fn get_bytes_content(node: &Node) -> Option<&[u8]> {
     match &node.content {
@@ -316,5 +338,32 @@ mod tests {
             parsed_skey.public_bytes.as_slice(),
             signed_prekey.public_key.public_key_bytes()
         );
+    }
+
+    // These strings are metric label values; drift silently breaks dashboards.
+    #[test]
+    fn retry_reason_as_str_is_stable() {
+        let cases = [
+            (RetryReason::UnknownError, "unknown"),
+            (RetryReason::NoSession, "no_session"),
+            (RetryReason::InvalidKey, "invalid_key"),
+            (RetryReason::InvalidKeyId, "invalid_key_id"),
+            (RetryReason::InvalidMessage, "invalid_message"),
+            (RetryReason::InvalidSignature, "invalid_signature"),
+            (RetryReason::FutureMessage, "future_message"),
+            (RetryReason::BadMac, "bad_mac"),
+            (RetryReason::InvalidSession, "invalid_session"),
+            (RetryReason::InvalidMsgKey, "invalid_msg_key"),
+            (
+                RetryReason::BadBroadcastEphemeralSetting,
+                "bad_broadcast_ephemeral",
+            ),
+            (RetryReason::UnknownCompanionNoPrekey, "unknown_companion"),
+            (RetryReason::AdvFailure, "adv_failure"),
+            (RetryReason::StatusRevokeDelay, "status_revoke_delay"),
+        ];
+        for (reason, expected) in cases {
+            assert_eq!(reason.as_str(), expected);
+        }
     }
 }

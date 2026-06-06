@@ -208,7 +208,9 @@ impl Client {
     where
         F: std::future::Future<Output = Result<(), crate::client::ClientError>>,
     {
+        let _t = wacore::telemetry::timer(wacore::telemetry::IQ_DURATION);
         if !self.is_running.load(Ordering::Relaxed) {
+            wacore::telemetry::iq("error");
             return Err(IqError::NotConnected);
         }
 
@@ -224,11 +226,13 @@ impl Client {
 
         if !self.is_running.load(Ordering::Acquire) {
             self.response_waiters.lock().await.remove(&req_id);
+            wacore::telemetry::iq("error");
             return Err(IqError::NotConnected);
         }
 
         if let Err(e) = send_fn.await {
             self.response_waiters.lock().await.remove(&req_id);
+            wacore::telemetry::iq("error");
             return match e {
                 ClientError::Socket(s_err) => Err(IqError::Socket(s_err)),
                 ClientError::EncryptSend(es_err) => Err(IqError::EncryptSend(es_err)),
@@ -240,7 +244,7 @@ impl Client {
         }
 
         let request_utils = self.get_request_utils();
-        futures::select! {
+        let result = futures::select! {
             result = rt_timeout(&*self.runtime, timeout, rx).fuse() => {
                 match result {
                     Ok(Ok(response_node)) => match request_utils.parse_iq_response(response_node.get()) {
@@ -258,6 +262,12 @@ impl Client {
                 self.response_waiters.lock().await.remove(&req_id);
                 Err(IqError::NotConnected)
             }
-        }
+        };
+        wacore::telemetry::iq(match &result {
+            Ok(_) => "ok",
+            Err(IqError::Timeout) => "timeout",
+            Err(_) => "error",
+        });
+        result
     }
 }
