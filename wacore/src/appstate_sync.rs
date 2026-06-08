@@ -307,7 +307,14 @@ impl AppStateProcessor {
             let (snapshot_result, snapshot_state) = result;
             state = snapshot_state;
 
-            new_mutations.extend(snapshot_result.mutations);
+            // Snapshot owns the whole collection: move its Vec into the empty
+            // accumulator rather than extend, which would allocate + copy a second
+            // collection-sized buffer at the memory peak. is_empty falls back to extend.
+            if new_mutations.is_empty() {
+                new_mutations = snapshot_result.mutations;
+            } else {
+                new_mutations.extend(snapshot_result.mutations);
+            }
 
             // A snapshot is a fresh baseline, so wipe the collection's prior mutation
             // MACs first (unconditionally, even if the snapshot has none) — leftover
