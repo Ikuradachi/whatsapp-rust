@@ -334,11 +334,11 @@ fn detect_duplicate_index_in_patch(mutations: &[wa::SyncdMutation]) -> Result<()
 /// * `state` - The hash state AFTER applying the patch mutations
 /// * `keys` - The expanded app state keys for MAC computation
 /// * `collection_name` - The collection name
-/// * `had_no_prior_state` - If true, skip ALL MAC validation. This should be true
-///   when processing patches without a prior local state (e.g., first sync without snapshot).
-///   WhatsApp Web handles this case by throwing a retryable error ("empty lthash"), but we
-///   can safely skip validation and process the mutations for usability. The state will be
-///   corrected on the next proper sync with a snapshot.
+/// * `had_no_prior_state` - If true, skip ALL MAC validation. On an empty collection
+///   this is only reached for the genesis patch (version 1), which has no prior baseline
+///   to validate against. The empty + non-genesis case (a patch without a snapshot that
+///   can't anchor the ltHash) is rejected upstream in `process_patch_list`, which marks
+///   the collection retryable so it re-syncs via snapshot, matching WhatsApp Web.
 /// * `has_missing_remove` - If true, a REMOVE mutation was missing its previous value.
 ///   WhatsApp Web tracks this and makes MAC validation failures non-fatal in this case,
 ///   because the ltHash is expected to diverge when we can't subtract a value we don't have.
@@ -350,12 +350,11 @@ pub fn validate_patch_macs(
     had_no_prior_state: bool,
     has_missing_remove: bool,
 ) -> Result<(), AppStateError> {
-    // Skip ALL MAC validation if we had no prior state.
-    // When we receive patches without a snapshot for a never-synced collection,
-    // WhatsApp Web throws a retryable "empty lthash" error. We can't properly validate
-    // either the snapshotMac (computed from wrong baseline) or the patchMac (which
-    // includes the snapshotMac). Instead, we process the mutations and rely on
-    // future syncs with snapshots to correct the state.
+    // Skip ALL MAC validation only for the genesis patch (version 1) seeding an
+    // empty baseline: there is no prior snapshotMac/patchMac baseline to validate
+    // against. The empty + non-genesis case (a patch without a snapshot that can't
+    // anchor the ltHash) is rejected upstream in `process_patch_list` as a retryable
+    // resync, so it never reaches here.
     if had_no_prior_state {
         return Ok(());
     }
