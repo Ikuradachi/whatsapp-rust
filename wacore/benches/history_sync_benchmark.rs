@@ -53,25 +53,25 @@ fn build_realistic_history_sync(n_convos: usize, msgs_per_convo: usize) -> Vec<u
                         })),
                         ..Default::default()
                     })),
-                    message_context_info: Some(wa::MessageContextInfo {
+                    message_context_info: Some(Box::new(wa::MessageContextInfo {
                         message_secret: Some(vec![m as u8; 32]),
                         ..Default::default()
-                    }),
+                    })),
                     ..Default::default()
                 }
             };
             messages.push(wa::HistorySyncMsg {
-                message: Some(wa::WebMessageInfo {
+                message: Some(Box::new(wa::WebMessageInfo {
                     key: wa::MessageKey {
                         remote_jid: Some(chat.clone()),
                         from_me: Some(from_me),
                         id: Some(format!("MSGID{c:04}{m:04}ABCDEF")),
                         participant: None,
                     },
-                    message: Some(inner),
+                    message: Some(Box::new(inner)),
                     message_timestamp: Some(1_700_000_000 + (c * msgs_per_convo + m) as u64),
                     ..Default::default()
-                }),
+                })),
                 ..Default::default()
             });
         }
@@ -103,14 +103,33 @@ fn bench_process_history_sync(bencher: divan::Bencher) {
     bencher
         .with_inputs(setup_history_sync_blob)
         .bench_values(|blob| {
-            // retain_blob = true exercises the full-buffer path. The result
-            // (records + retained blob) is returned so the harness drops it
-            // outside the measured window, like a consumer would later.
+            // retain_blob = true also hands the compressed input back. The
+            // result (records + retained blob) is returned so the harness
+            // drops it outside the measured window, like a consumer would.
             black_box(wacore::history_sync::process_history_sync(
                 black_box(blob),
                 None,
                 true,
-                None,
             ))
+        });
+}
+
+/// Consumer-side pass over the retained blob: drain every conversation through
+/// the public stream and decode the remainder, the path an Event::HistorySync
+/// handler pays per chunk.
+#[divan::bench(sample_count = 5)]
+fn bench_history_sync_stream_drain(bencher: divan::Bencher) {
+    bencher
+        .with_inputs(setup_history_sync_blob)
+        .bench_values(|blob| {
+            let mut stream = wacore::history_sync::HistorySyncStream::new(
+                black_box(&blob),
+                wacore::history_sync::MAX_DECOMPRESSED,
+            );
+            let mut messages = 0usize;
+            while let Some(conversation) = stream.next_conversation().unwrap() {
+                messages += conversation.messages.len();
+            }
+            black_box((messages, stream.remainder().unwrap()))
         });
 }

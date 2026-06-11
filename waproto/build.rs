@@ -57,6 +57,14 @@ fn main() -> std::io::Result<()> {
         ".whatsapp.SenderKeyStateStructure.SenderSigningKey",
     ]);
 
+    // Boxed: large (and mostly absent-on-the-wire) submessages whose inline
+    // form makes prost's repeated-field decode memcpy-bound — every element
+    // pays push(default) plus Vec-growth copies of the full struct size.
+    config.boxed(".whatsapp.HistorySyncMsg.message");
+    config.boxed(".whatsapp.WebMessageInfo.message");
+    config.boxed(".whatsapp.WebMessageInfo.statusMentionMessageInfo");
+    config.boxed(".whatsapp.Message.messageContextInfo");
+
     // Bytes fields lack serde support; skip them (internal crypto state).
     config.field_attribute(
         ".whatsapp.SessionStructure.Chain.ChainKey.key",

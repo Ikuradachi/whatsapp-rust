@@ -33,6 +33,7 @@ pub struct InflateReader<'a> {
     total_out: u64,
     max: u64,
     eof: bool,
+    stream_end: bool,
 }
 
 impl<'a> InflateReader<'a> {
@@ -60,6 +61,7 @@ impl<'a> InflateReader<'a> {
             total_out: 0,
             max,
             eof: false,
+            stream_end: false,
         }
     }
 
@@ -92,6 +94,19 @@ impl<'a> InflateReader<'a> {
         self.eof && self.cursor >= self.buf.len()
     }
 
+    /// Total decompressed bytes produced so far. After the stream ends this is
+    /// the blob's exact inflated size.
+    pub fn total_out(&self) -> u64 {
+        self.total_out
+    }
+
+    /// Whether zlib reported a proper stream end (terminator + adler32
+    /// checksum). An EOF (`ensure` returning false) without this means the
+    /// input was truncated, not finished.
+    pub fn stream_ended(&self) -> bool {
+        self.stream_end
+    }
+
     fn pump(&mut self) -> io::Result<()> {
         // Drop the consumed prefix before growing, so the buffer holds roughly
         // just the record currently being accumulated.
@@ -100,19 +115,22 @@ impl<'a> InflateReader<'a> {
             self.cursor = 0;
         }
 
-        let mut chunk = [0u8; Self::CHUNK];
         // `decomp` is `Some` for the reader's whole lifetime (only `Drop` takes it),
         // so this is unreachable in practice; surface it as an error rather than panic.
         let decomp = self
             .decomp
             .as_mut()
             .ok_or_else(|| io::Error::other("InflateReader used after pool return"))?;
+        // Inflate straight into the window's spare capacity: a stack chunk +
+        // extend_from_slice would copy every decompressed byte a second time
+        // (~10% of a history-sync extraction).
+        self.buf.reserve(Self::CHUNK);
         let prev_in = decomp.total_in();
         let prev_out = decomp.total_out();
         let status = decomp
-            .decompress(
+            .decompress_vec(
                 &self.input[self.in_pos..],
-                &mut chunk,
+                &mut self.buf,
                 FlushDecompress::None,
             )
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -126,14 +144,18 @@ impl<'a> InflateReader<'a> {
                 format!("decompressed payload exceeds {} bytes", self.max),
             ));
         }
-        self.buf.extend_from_slice(&chunk[..produced]);
 
         match status {
-            Status::StreamEnd => self.eof = true,
+            Status::StreamEnd => {
+                self.eof = true;
+                self.stream_end = true;
+            }
             // No output produced and not at stream end: distinguish a truncated
-            // tail (no input left → treat as end) from a stalled/corrupt stream
-            // (input remains but the decompressor consumed none → error, instead
-            // of spinning forever since 64 KB of output is always available).
+            // tail (no input left → treat as end, with `stream_end` left false
+            // so callers can tell it apart from a real terminator) from a
+            // stalled/corrupt stream (input remains but the decompressor
+            // consumed none → error, instead of spinning forever since 64 KB of
+            // output is always available).
             // Mirrors the no-progress guard in `decompress_zlib_pooled`.
             _ if produced == 0 => {
                 if self.in_pos >= self.input.len() {
@@ -225,8 +247,12 @@ pub fn decompress_zlib_pooled(compressed: &[u8], max_size: u64) -> io::Result<Ve
         // every multi-MB history-sync chunk. 2x the compressed length is a
         // conservative first guess (zlib here compresses ~2-5x): it rarely
         // overshoots the real size, so it cuts reallocations without inflating
-        // peak memory. Bounded by `cap` so a bad guess can't exceed the limit.
-        let estimated = compressed.len().saturating_mul(2).clamp(4096, cap);
+        // peak memory. Bounded by `cap` so a bad guess can't exceed the limit;
+        // the floor also bows to `cap` because callers now pass exact (possibly
+        // tiny) decompressed sizes as the limit, where a fixed 4096 floor would
+        // invert the clamp and panic.
+        let floor = 4096.min(cap);
+        let estimated = compressed.len().saturating_mul(2).clamp(floor, cap);
         if scratch.capacity() < estimated {
             scratch.reserve(estimated - scratch.capacity());
         }
