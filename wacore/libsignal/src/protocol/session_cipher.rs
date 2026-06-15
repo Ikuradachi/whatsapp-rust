@@ -52,6 +52,13 @@ impl EncryptionBuffer {
         &mut self.buffer
     }
 }
+
+/// Current capacity of this thread's encrypt buffer. Test-only: lets the
+/// oversized-buffer-release regression test observe the thread-local.
+#[cfg(test)]
+fn encryption_buffer_capacity() -> usize {
+    ENCRYPTION_BUFFER.with(|b| b.borrow().buffer.capacity())
+}
 use crate::protocol::consts::MAX_FORWARD_JUMPS;
 use crate::protocol::ratchet::keys::MessageKeyGenerator;
 use crate::protocol::ratchet::{ChainKey, UsePQRatchet};
@@ -148,63 +155,75 @@ async fn message_encrypt_inner(
         ));
     }
 
-    let ctext = ENCRYPTION_BUFFER.with(|buffer| {
+    // Encrypt into the thread-local buffer and build the message while still
+    // borrowing it: SignalMessage::new copies the ciphertext into its protobuf
+    // body, so no owned intermediate Vec is needed. The buffer is reused across
+    // calls (cleared, capacity kept) instead of being taken out and reallocated.
+    // aes_256_cbc_encrypt appends from buf.len(), so clear it first; this also
+    // drops any ciphertext left by a prior call that errored.
+    let message = ENCRYPTION_BUFFER.with(|buffer| {
         let mut buf_wrapper = buffer.borrow_mut();
         let buf = buf_wrapper.get_buffer();
+        buf.clear();
         aes_256_cbc_encrypt_into(ptext, message_keys.cipher_key(), message_keys.iv(), buf)
             .map_err(|_| {
                 log::error!("session state corrupt for {remote_address}");
                 SignalProtocolError::InvalidSessionStructure("invalid sender chain message keys")
             })?;
-        let result = std::mem::take(buf);
-        // Restore buffer capacity for next use (take() leaves empty Vec with 0 capacity)
-        buf.reserve(EncryptionBuffer::INITIAL_CAPACITY);
-        Ok::<Vec<u8>, SignalProtocolError>(result)
+        let ctext = buf.as_slice();
+
+        let message = if let Some(items) = session_state.unacknowledged_pre_key_message_items()? {
+            let local_registration_id = session_state.local_registration_id();
+
+            log::debug!(
+                "Building PreKeyWhisperMessage for: {} with preKeyId: {}",
+                remote_address,
+                items
+                    .pre_key_id()
+                    .map_or_else(|| "<none>".to_string(), |id| id.to_string()),
+            );
+
+            let message = SignalMessage::new(
+                session_version,
+                message_keys.mac_key(),
+                sender_ephemeral,
+                chain_key.index(),
+                previous_counter,
+                ctext,
+                &local_identity_key,
+                &their_identity_key,
+            )?;
+
+            CiphertextMessage::PreKeySignalMessage(PreKeySignalMessage::new(
+                session_version,
+                local_registration_id,
+                items.pre_key_id(),
+                items.signed_pre_key_id(),
+                *items.base_key(),
+                local_identity_key,
+                message,
+            )?)
+        } else {
+            CiphertextMessage::SignalMessage(SignalMessage::new(
+                session_version,
+                message_keys.mac_key(),
+                sender_ephemeral,
+                chain_key.index(),
+                previous_counter,
+                ctext,
+                &local_identity_key,
+                &their_identity_key,
+            )?)
+        };
+        // A plaintext whose ciphertext exceeds MAX_CAPACITY leaves an oversized
+        // buffer in thread-local storage; release it now (the old take+realloc
+        // path did this implicitly) so a single large send doesn't pin memory
+        // per worker thread until get_buffer's periodic shrink fires.
+        if buf.capacity() > EncryptionBuffer::MAX_CAPACITY {
+            *buf = Vec::with_capacity(EncryptionBuffer::INITIAL_CAPACITY);
+        }
+        Ok::<CiphertextMessage, SignalProtocolError>(message)
     })?;
-
-    let message = if let Some(items) = session_state.unacknowledged_pre_key_message_items()? {
-        let local_registration_id = session_state.local_registration_id();
-
-        log::debug!(
-            "Building PreKeyWhisperMessage for: {} with preKeyId: {}",
-            remote_address,
-            items
-                .pre_key_id()
-                .map_or_else(|| "<none>".to_string(), |id| id.to_string()),
-        );
-
-        let message = SignalMessage::new(
-            session_version,
-            message_keys.mac_key(),
-            sender_ephemeral,
-            chain_key.index(),
-            previous_counter,
-            &ctext,
-            &local_identity_key,
-            &their_identity_key,
-        )?;
-
-        CiphertextMessage::PreKeySignalMessage(PreKeySignalMessage::new(
-            session_version,
-            local_registration_id,
-            items.pre_key_id(),
-            items.signed_pre_key_id(),
-            *items.base_key(),
-            local_identity_key,
-            message,
-        )?)
-    } else {
-        CiphertextMessage::SignalMessage(SignalMessage::new(
-            session_version,
-            message_keys.mac_key(),
-            sender_ephemeral,
-            chain_key.index(),
-            previous_counter,
-            &ctext,
-            &local_identity_key,
-            &their_identity_key,
-        )?)
-    };
 
     identity_store
         .save_identity(remote_address, &their_identity_key)
@@ -1747,6 +1766,37 @@ mod tests {
             .await
             .expect("Bob decrypts legit m2 after rollback");
             assert_eq!(p2.plaintext, b"second");
+        });
+    }
+
+    /// Reusing the encrypt buffer must not pin an oversized allocation: a
+    /// plaintext larger than MAX_CAPACITY grows the thread-local buffer, which
+    /// has to be released after the message is built (the old take+realloc path
+    /// did this implicitly).
+    #[test]
+    fn encrypt_releases_oversized_buffer() {
+        let mut tp = setup_established_session();
+        futures::executor::block_on(async {
+            let big = vec![7u8; 32 * 1024]; // ciphertext far exceeds MAX_CAPACITY (16 KiB)
+            message_encrypt(
+                &big,
+                &tp.bob_addr,
+                &mut tp.alice_sessions,
+                &mut tp.alice_identity,
+            )
+            .await
+            .expect("encrypt large message");
+
+            // The fix's contract is "buffer must not exceed MAX_CAPACITY after a
+            // send". Asserting against MAX (not INITIAL) keeps the test robust:
+            // Vec::with_capacity only guarantees a lower bound, so an allocator
+            // that rounds up must not flake this. A 32 KiB plaintext without the
+            // release leaves the buffer well above MAX (~32 KiB).
+            let cap = encryption_buffer_capacity();
+            assert!(
+                cap <= EncryptionBuffer::MAX_CAPACITY,
+                "encrypt buffer should be released after an oversized send, got capacity {cap}"
+            );
         });
     }
 
