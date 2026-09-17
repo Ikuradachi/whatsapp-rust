@@ -1,6 +1,7 @@
 //! App-state collection sync and mutation dispatch.
 
 use super::*;
+use crate::features::{AppStateError, AppStateResyncMode, AppStateResyncReport};
 use crate::request::DEFAULT_IQ_TIMEOUT;
 
 /// Concurrency cap for pre-downloading app-state external blobs (independent CDN
@@ -947,6 +948,15 @@ impl Client {
                 );
             }))
             .detach();
+    }
+
+    /// Replays one collection from the beginning.
+    pub async fn resync_app_state_collection(
+        &self,
+        name: WAPatchName,
+    ) -> Result<AppStateResyncReport, AppStateError> {
+        self.resync_app_state([name], AppStateResyncMode::Snapshot)
+            .await
     }
 
     /// Public entry point for processing [`MajorSyncTask`] from the sync channel.
@@ -3762,6 +3772,19 @@ mod tests {
             || Arc::strong_count(&client) <= before,
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn collection_replay_reports_unknown_collection() {
+        let client =
+            crate::test_utils::create_test_client_with_name("appstate_replay_unknown").await;
+
+        let error = client
+            .resync_app_state_collection(WAPatchName::Unknown)
+            .await
+            .expect_err("unknown collection must not be replayed");
+
+        assert!(matches!(error, AppStateError::InvalidRequest(_)));
     }
 
     #[tokio::test]

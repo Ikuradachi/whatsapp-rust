@@ -1,7 +1,7 @@
 //! Chat management via app state sync (syncd).
 //!
 //! ## Collections (from WhatsApp Web JS)
-//! - `regular_low`: archive, pin, markChatAsRead
+//! - `regular_low`: archive, pin, markChatAsRead, lock
 //! - `regular_high`: mute, star, deleteChat, deleteMessageForMe
 
 use crate::appstate_sync::Mutation;
@@ -13,8 +13,8 @@ use wacore::appstate::patch_decode::WAPatchName;
 use wacore::appstate::schemas::{self, IndexPart, Schema};
 use wacore::types::events::{
     ArchiveUpdate, ClearChatUpdate, ContactRemoved, ContactUpdate, DeleteChatUpdate,
-    DeleteMessageForMeUpdate, Event, MarkChatAsReadUpdate, MuteUpdate, PinUpdate, StarUpdate,
-    UserStatusMuteUpdate,
+    DeleteMessageForMeUpdate, Event, LockChatUpdate, MarkChatAsReadUpdate, MuteUpdate, PinUpdate,
+    StarUpdate, UserStatusMuteUpdate,
 };
 use wacore_binary::{Jid, JidExt};
 use waproto::whatsapp as wa;
@@ -114,6 +114,7 @@ pub(crate) fn dispatch_chat_mutation(
             | "markChatAsRead"
             | "deleteChat"
             | "clearChat"
+            | "lock"
             | "userStatusMute"
             | "deleteMessageForMe"
     ) {
@@ -283,6 +284,21 @@ pub(crate) fn dispatch_chat_mutation(
                         .delete_media(delete_media)
                         .timestamp(time)
                         .action(Box::new(act))
+                        .from_full_sync(full_sync)
+                        .build(),
+                ));
+            }
+            true
+        }
+        "lock" => {
+            if let Some(val) = &m.action_value
+                && let Some(act) = val.lock_chat_action.as_option()
+            {
+                event_bus.dispatch(Event::LockChatUpdate(
+                    LockChatUpdate::builder()
+                        .jid(jid)
+                        .timestamp(time)
+                        .action(Box::new(act.clone()))
                         .from_full_sync(full_sync)
                         .build(),
                 ));
@@ -493,6 +509,18 @@ impl<'a> ChatActions<'a> {
     pub async fn unmute_chat(&self, jid: &Jid) -> Result<(), AppStateError> {
         debug!("Unmuting chat {jid}");
         self.send_mute_mutation(jid, false, 0).await
+    }
+
+    /// Chat lock: moves the chat into the account's "locked chats" folder.
+    /// Only the lock state syncs; no message or key leaves the device.
+    pub async fn lock_chat(&self, jid: &Jid) -> Result<(), AppStateError> {
+        debug!("Locking chat {jid}");
+        self.send_lock_mutation(jid, true).await
+    }
+
+    pub async fn unlock_chat(&self, jid: &Jid) -> Result<(), AppStateError> {
+        debug!("Unlocking chat {jid}");
+        self.send_lock_mutation(jid, false).await
     }
 
     /// `participant_jid`: required for group messages from others, `None` otherwise.
@@ -796,6 +824,20 @@ impl<'a> ChatActions<'a> {
             .await
     }
 
+    async fn send_lock_mutation(&self, jid: &Jid, locked: bool) -> Result<(), AppStateError> {
+        let value = wa::SyncActionValue {
+            lock_chat_action: buffa::MessageField::some(wa::sync_action_value::LockChatAction {
+                locked: Some(locked),
+            }),
+            timestamp: Some(wacore::time::now_millis()),
+            ..Default::default()
+        };
+        let jid = jid.to_string();
+        self.client
+            .send_app_state_action(&schemas::LOCK_CHAT, &[jid.as_str()], &value)
+            .await
+    }
+
     async fn send_star_mutation(
         &self,
         chat_jid: &Jid,
@@ -1059,6 +1101,11 @@ mod registry_tests {
                 &["mute", "123@s.whatsapp.net"],
             ),
             (
+                &schemas::LOCK_CHAT,
+                &["123@s.whatsapp.net"],
+                &["lock", "123@s.whatsapp.net"],
+            ),
+            (
                 &schemas::MARK_CHAT_AS_READ,
                 &["123@s.whatsapp.net"],
                 &["markChatAsRead", "123@s.whatsapp.net"],
@@ -1272,7 +1319,7 @@ mod registry_tests {
     fn a_remove_on_another_kind_is_not_claimed() {
         // Only `contact` models deletion as a Remove; a Remove on anything else
         // must fall through untouched rather than be read as its Set.
-        for kind in ["mute", "pin", "archive", "star"] {
+        for kind in ["mute", "pin", "archive", "star", "lock"] {
             let m = Mutation {
                 index: vec![kind.into(), "12025550111@s.whatsapp.net".into()],
                 operation: wa::syncd_mutation::SyncdOperation::REMOVE,
@@ -1296,6 +1343,64 @@ mod registry_tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[test]
+    fn a_lock_set_dispatches_a_lock_chat_update() {
+        // Chat lock's "off" state is a Set carrying locked: false, so both
+        // directions arrive as Sets over ["lock", jid].
+        for locked in [true, false] {
+            let m = Mutation {
+                index: vec!["lock".into(), "12025550111@s.whatsapp.net".into()],
+                operation: wa::syncd_mutation::SyncdOperation::SET,
+                action_value: Some(wa::SyncActionValue {
+                    lock_chat_action: buffa::MessageField::some(
+                        wa::sync_action_value::LockChatAction {
+                            locked: Some(locked),
+                        },
+                    ),
+                    ..Default::default()
+                }),
+            };
+            let (handled, events) = dispatch_into_recorder(&m);
+            assert!(handled);
+            match &*events[0] {
+                Event::LockChatUpdate(u) => {
+                    assert_eq!(u.action.locked, Some(locked));
+                    assert_eq!(u.jid.to_string(), "12025550111@s.whatsapp.net");
+                }
+                other => panic!("expected LockChatUpdate, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn lock_chat_round_trips_to_an_event() {
+        let jid: Jid = "12025550111@s.whatsapp.net".parse().expect("test JID");
+        let mutation = capture_app_state_mutation(
+            collection_patch_name(schemas::LOCK_CHAT.collection).as_str(),
+            {
+                let jid = jid.clone();
+                move |client| async move { client.chat_actions().lock_chat(&jid).await }
+            },
+        )
+        .await;
+
+        let parts = &mutation.index;
+        assert_eq!(
+            parts,
+            &["lock".to_string(), "12025550111@s.whatsapp.net".to_string()]
+        );
+
+        let (handled, events) = dispatch_into_recorder(&mutation);
+        assert!(handled);
+        match &*events[0] {
+            Event::LockChatUpdate(u) => {
+                assert_eq!(u.jid, jid);
+                assert_eq!(u.action.locked, Some(true));
+            }
+            other => panic!("expected LockChatUpdate, got {other:?}"),
+        }
     }
 
     fn dispatch_into_recorder(m: &Mutation) -> (bool, Vec<std::sync::Arc<Event>>) {
