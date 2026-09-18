@@ -293,8 +293,10 @@ pub mod socket;
 pub mod store;
 pub mod transport;
 pub mod upload;
-#[cfg(feature = "voip-runtime")]
+#[cfg(feature = "voip-control")]
 pub mod voip;
+#[cfg(feature = "voip-control")]
+pub mod voip_control;
 pub use upload::UploadOptions;
 
 pub mod pdo;

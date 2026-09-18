@@ -17,98 +17,21 @@
 //! task, so plain `u32` beats atomics; increments saturate rather than wrap so a pathological peer
 //! cannot make a counter run backwards.
 
-use super::engine::{Millis, NEVER};
+/// Monotonic milliseconds. The shell supplies it; the engine never reads a clock.
+pub type Millis = u64;
+
+/// Sentinel deadline meaning "no timer pending"; the shell waits only on I/O until the next input.
+pub const NEVER: Millis = u64::MAX;
 
 /// Counters for one call's media plane, snapshot by value.
 ///
 /// Read through `CallEngine::media_stats()` or `CallHandle::media_stats()`. Fields are additive for
 /// the life of the call; a consumer that wants a rate samples twice and subtracts.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct CallMediaStats {
-    /// Audio RTP packets that authenticated and reached codec dispatch.
-    pub rtp_received: u32,
-    /// Packets whose payload type is outside the negotiated profile. A peer that switched RTP
-    /// profiles under us shows up here and nowhere else.
-    pub rtp_payload_type_unexpected: u32,
-    /// Packets whose SRTP/WARP tag did not verify. Sustained non-zero with `rtp_received` at zero
-    /// is the "deaf with no symptom" failure: wrong recv keys, wrong peer LID, or a stale ROC.
-    pub srtp_unprotect_failed: u32,
-    /// Packets where an SFrame session was installed but GCM did not authenticate, so the payload
-    /// was passed through as plaintext.
-    pub sframe_decrypt_failed: u32,
-    /// Audio frames that produced PCM (`AudioIo::Pcm`).
-    pub audio_frames_decoded: u32,
-    /// Encoded payloads handed to the application sink (`AudioIo::Encoded`).
-    pub audio_frames_delivered: u32,
-    /// Frames the MLow decoder concealed instead of decoding.
-    pub audio_frames_concealed: u32,
-    /// MLow frames refused by the operating-point guard.
-    pub mlow_off_point_dropped: u32,
-    /// MLow frames that carried no decodable body (SID) or were coded inactive.
-    pub mlow_inactive_or_sid: u32,
-    /// Frames decoded by an injected [`super::audio::ForeignAudioCodec`].
-    pub foreign_frames_decoded: u32,
-    /// Frames the peer sent in a codec this build has no decoder for. Not recoverable inside the
-    /// call, and the one silence reason a consumer can act on before the next call.
-    ///
-    /// Inbound only. The send-side twin is [`Self::outbound_frames_without_encoder`], and they are
-    /// deliberately separate: [`AudioSilenceReason`] describes why WE hear nothing, so folding an
-    /// encode gap into it would answer an inbound question with an outbound fact.
-    pub audio_frames_without_decoder: u32,
-    /// Mic frames dropped because the call switched to a codec this build cannot encode.
-    ///
-    /// The peer hears nothing. Invisible from every other counter here, which describe reception.
-    pub outbound_frames_without_encoder: u32,
-    /// Samples discarded from the head of the playout buffer to hold the latency ceiling.
-    pub playout_trimmed_samples: u32,
-    /// Inbound media the relay read pump discarded under backpressure, before the engine.
-    pub inbound_pipe_dropped: u32,
-    /// Playout the consumer's own sink refused, after the engine produced it.
-    ///
-    /// The counters above describe the engine's output, so a frame it hands over is counted as
-    /// produced whether or not the application takes it. Without this one, an application whose
-    /// speaker or encoded-audio channel has stalled hears nothing while every counter says the call
-    /// is healthy -- and it IS healthy: this is the one loss on the receive path that belongs to
-    /// the consumer rather than to the call, which is why it does not feed the silence alarm.
-    pub audio_sink_dropped: u32,
-    /// Reassembled access units the consumer's video sink refused, for the same
-    /// reason `audio_sink_dropped` exists: the engine produced them and the
-    /// application did not take them, which is a loss no other counter shows.
-    pub video_sink_dropped: u32,
-    /// Peer-keyframe requests that reached the outbox, after the throttle.
-    ///
-    /// The engine sends these on its own initiative as well as on the
-    /// application's, and each one costs the peer its largest frame. Without a
-    /// count there is no way to tell a recovering call from one asking in a loop.
-    pub peer_keyframe_requests: u32,
-    /// Relay datagrams the media plane could not read: neither STUN, RTP nor RTCP, or RTP-shaped
-    /// but too short or malformed to parse a header from.
-    ///
-    /// Both are the same fact -- bytes arrived and meant nothing here -- and both have to be
-    /// counted, because the silence alarm reads arrivals: a stream of unreadable datagrams that
-    /// left no trace would be reported as a reception that never started.
-    pub relay_packet_unclassified: u32,
-    /// Group forwarding envelopes that failed to unwrap.
-    pub forwarding_envelope_rejected: u32,
-    /// Times the payload grammar in use changed within the negotiated timing.
-    pub codec_switches: u16,
-}
-
-impl CallMediaStats {
-    /// Audio units that actually reached a consumer, whichever I/O mode is in use.
-    ///
-    /// The modes cannot be summed blindly elsewhere: a PCM/MLOW call increments
-    /// `audio_frames_decoded`, a PCM call rescued onto an injected codec increments
-    /// `foreign_frames_decoded`, and an encoded call increments `audio_frames_delivered`. A consumer
-    /// asking "is this call carrying audio" needs one number that means that in all three.
-    #[must_use]
-    pub const fn audio_produced(&self) -> u32 {
-        self.audio_frames_decoded
-            .saturating_add(self.audio_frames_delivered)
-            .saturating_add(self.foreign_frames_decoded)
-    }
-}
+///
+/// This is the neutral [`MediaStats`](super::MediaStats) under its historical engine name: one
+/// definition, so the engine's counters and the seam's cannot drift. [`MediaStatsCell`] publishes it
+/// across the task boundary.
+pub use super::MediaStats as CallMediaStats;
 
 /// A snapshot of [`CallMediaStats`] the drive loop publishes for a consumer to read.
 ///
@@ -137,27 +60,11 @@ impl MediaStatsCell {
 
 /// Why a call is carrying no audio, as far as the engine can tell.
 ///
-/// Ordered by how specific the explanation is: the watchdog reports the most specific reason whose
-/// counter dominates, because "we have no decoder for what the peer negotiated" and "the tags do
-/// not verify" call for completely different fixes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum AudioSilenceReason {
-    /// The peer negotiated a codec this build cannot decode (no `voip-libopus`, or a wasm32/ESP32
-    /// build with no foreign codec injected). Not recoverable inside the call.
-    NoDecoderForNegotiatedCodec,
-    /// Packets arrive and their tags do not verify. Almost always a keying problem.
-    AuthenticationFailing,
-    /// Packets arrive on a payload type outside the negotiated profile.
-    UnexpectedPayloadType,
-    /// The codec refused the frames: off operating point, or concealed as malformed.
-    CodecRejectingFrames,
-    /// The codec kept changing its mind. The probe latched to stop thrashing.
-    CodecFlapping,
-    /// Packets authenticated and decoded to nothing audible. Rare; keeps the enum total.
-    Unknown,
-}
+/// This is the neutral [`MediaSilenceReason`](super::MediaSilenceReason) under its historical engine
+/// name, one definition so the engine and a foreign backend name the same reasons.
+pub use super::MediaSilenceReason as AudioSilenceReason;
 
+#[cfg(feature = "voip")]
 /// What the watchdog decided on one evaluation.
 ///
 /// Kept separate from `CallEvent` so this module does not depend on the engine's event enum; the
@@ -177,11 +84,14 @@ pub(crate) enum AudioHealthAlarm {
     Stalled { silent_for_ms: Millis },
 }
 
+#[cfg(feature = "voip")]
 /// Evaluation cadence. Fine enough to catch the 2s window promptly, coarse enough that a call with
 /// healthy audio pays one comparison per second.
 const HEALTH_TICK_MS: Millis = 500;
+#[cfg(feature = "voip")]
 /// Sliding window over which "packets in, no audio out" is judged.
 const SILENT_WINDOW_MS: Millis = 2_000;
+#[cfg(feature = "voip")]
 /// Packets that must land inside the window before silence is diagnosable; below this it is jitter,
 /// not a diagnosis.
 ///
@@ -191,12 +101,15 @@ const SILENT_WINDOW_MS: Millis = 2_000;
 /// ever producing an alarm. Twelve is 1.44 s of media at 120 ms and 0.72 s at 60 ms: still most of
 /// the window in both, and still far above a jitter burst.
 const SILENT_WINDOW_MIN_PACKETS: u32 = 12;
+#[cfg(feature = "voip")]
 /// No audio RTP at all for this long -- since media came up, or since the last packet -- is a
 /// stalled reception.
 const STALL_AFTER_MS: Millis = 3_000;
+#[cfg(feature = "voip")]
 /// Re-alarm cadence while the condition persists, so a truncated log still catches it.
 const REALARM_MS: Millis = 10_000;
 
+#[cfg(feature = "voip")]
 /// Watches one call's audio for "connected but carrying nothing".
 #[derive(Debug)]
 pub(crate) struct AudioHealthWatch {
@@ -229,6 +142,7 @@ pub(crate) struct AudioHealthWatch {
     stall_reported: bool,
 }
 
+#[cfg(feature = "voip")]
 impl Default for AudioHealthWatch {
     fn default() -> Self {
         Self {
@@ -247,6 +161,7 @@ impl Default for AudioHealthWatch {
     }
 }
 
+#[cfg(feature = "voip")]
 impl AudioHealthWatch {
     /// Arm the watchdog. Called when the relay accepts the allocate, which is the first moment
     /// inbound media is even possible.
@@ -352,6 +267,7 @@ impl AudioHealthWatch {
     }
 }
 
+#[cfg(feature = "voip")]
 /// What moved between the start of a window and its end.
 ///
 /// Every field is monotonic, so a saturating subtraction is the whole story. Taking the delta is
@@ -420,6 +336,7 @@ fn window_delta(now: &CallMediaStats, then: &CallMediaStats) -> CallMediaStats {
     }
 }
 
+#[cfg(feature = "voip")]
 /// Pick the most specific explanation the counters support.
 ///
 /// Order matters and is not by magnitude: a build with no decoder explains everything downstream of
@@ -459,11 +376,12 @@ fn dominant_reason(stats: &CallMediaStats) -> AudioSilenceReason {
     AudioSilenceReason::Unknown
 }
 
+#[cfg(feature = "voip")]
 /// Switches past this in one call mean the evidence is contradicting itself; the probe latches and
 /// the watchdog says so rather than letting the codec thrash for the whole call.
 pub(crate) const CODEC_FLAP_LIMIT: u16 = 4;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "voip"))]
 mod tests {
     use super::*;
 

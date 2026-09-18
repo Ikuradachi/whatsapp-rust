@@ -2,11 +2,11 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use log::{debug, warn};
-#[cfg(feature = "voip-runtime")]
+#[cfg(feature = "voip-control")]
 use wacore::message_processing::EncType;
-#[cfg(feature = "voip-runtime")]
+#[cfg(feature = "voip-control")]
 use wacore::messages::MessageUtils;
-#[cfg(feature = "voip-runtime")]
+#[cfg(feature = "voip-control")]
 use wacore::stanza::call::{
     CAPABILITY_INDEX_MLOW_V1, CapabilityBit, REJECT_REASON_BUSY, REJECT_REASON_ENC,
     TERMINATE_REASON_ACCEPTED_ELSEWHERE, TERMINATE_REASON_GROUP_CALL_ENDED,
@@ -16,22 +16,26 @@ use wacore::stanza::call::{
 use wacore::stanza::call::{build_offer_ack_receipt, parse_call_stanza};
 use wacore::stanza::group_call::build_call_control_ack;
 use wacore::types::call::{CallAction, CallActionTag, IncomingCall, MissedCall, MissedReason};
-#[cfg(feature = "voip-runtime")]
+#[cfg(feature = "voip-control")]
 use wacore::types::call::{CallEndedElsewhere, ElsewhereOutcome, VideoState};
 use wacore::types::events::Event;
-#[cfg(feature = "voip-runtime")]
+#[cfg(feature = "voip-control")]
 use wacore::types::group_call::{GroupCallDevice, GroupCallEncRekey, ScreenShareState};
-#[cfg(feature = "voip-runtime")]
-use wacore::voip::GroupStateApply;
-#[cfg(feature = "voip-runtime")]
-use wacore::voip::{CallEvent, PeerVideoTransition, VideoControl};
-#[cfg(feature = "voip-runtime")]
+#[cfg(feature = "voip-control")]
+use wacore::voip_control::CallEvent;
+#[cfg(feature = "voip-control")]
+use wacore::voip_control::control::VideoControl;
+#[cfg(feature = "voip-control")]
+use wacore::voip_control::group::GroupStateApply;
+#[cfg(feature = "voip-control")]
+use wacore::voip_control::registry::PeerVideoTransition;
+#[cfg(feature = "voip-control")]
 use wacore_binary::Jid;
 use wacore_binary::{OwnedNodeRef, Server};
-#[cfg(feature = "voip-runtime")]
+#[cfg(feature = "voip-control")]
 use zeroize::Zeroizing;
 
-#[cfg(feature = "voip-runtime")]
+#[cfg(feature = "voip-control")]
 use crate::client::CallError;
 use crate::client::Client;
 
@@ -84,9 +88,9 @@ impl StanzaHandler for CallHandler {
         }
         match parse_call_stanza(nr) {
             Ok(Some(call)) => {
-                #[cfg(feature = "voip-runtime")]
+                #[cfg(feature = "voip-control")]
                 let mut call = call;
-                #[cfg(feature = "voip-runtime")]
+                #[cfg(feature = "voip-control")]
                 if matches!(
                     &call.action,
                     CallAction::GroupUpdate { update } if update.rekey_requested
@@ -101,9 +105,9 @@ impl StanzaHandler for CallHandler {
                         );
                     }
                 }
-                #[cfg(feature = "voip-runtime")]
+                #[cfg(feature = "voip-control")]
                 let is_terminate = matches!(&call.action, CallAction::Terminate { .. });
-                #[cfg(feature = "voip-runtime")]
+                #[cfg(feature = "voip-control")]
                 let is_group_transition = matches!(
                     &call.action,
                     CallAction::GroupUpdate { .. }
@@ -112,7 +116,7 @@ impl StanzaHandler for CallHandler {
                         | CallAction::RaiseHand { .. }
                         | CallAction::ScreenShare { .. }
                 ) || is_terminate;
-                #[cfg(feature = "voip-runtime")]
+                #[cfg(feature = "voip-control")]
                 let group_transition = if is_group_transition {
                     client
                         .call_registry()
@@ -120,10 +124,10 @@ impl StanzaHandler for CallHandler {
                 } else {
                     None
                 };
-                #[cfg(feature = "voip-runtime")]
+                #[cfg(feature = "voip-control")]
                 let group_transition_generation =
                     group_transition.as_ref().map(|(generation, _)| *generation);
-                #[cfg(feature = "voip-runtime")]
+                #[cfg(feature = "voip-control")]
                 let _group_transition_guard = if let Some((_, lock)) = group_transition.as_ref() {
                     Some(lock.lock().await)
                 } else {
@@ -141,7 +145,7 @@ impl StanzaHandler for CallHandler {
                         return true;
                     }
                 }
-                #[cfg(feature = "voip-runtime")]
+                #[cfg(feature = "voip-control")]
                 if let Some(generation) = group_transition_generation
                     && !client
                         .call_registry()
@@ -154,14 +158,14 @@ impl StanzaHandler for CallHandler {
                     );
                     return true;
                 }
-                #[cfg(feature = "voip-runtime")]
+                #[cfg(feature = "voip-control")]
                 let is_group_terminate = is_terminate
                     && group_transition_generation.is_some_and(|generation| {
                         client
                             .call_registry()
                             .is_group_call_if_current(call.action.call_id(), generation)
                     });
-                #[cfg(feature = "voip-runtime")]
+                #[cfg(feature = "voip-control")]
                 if is_group_terminate
                     && !group_transition_generation.is_some_and(|generation| {
                         client.call_registry().group_creator_authorized_if_current(
@@ -211,14 +215,14 @@ impl StanzaHandler for CallHandler {
                     // offer-ack await: <call> stanzas are processed concurrently, so a fast <terminate>
                     // for this offer racing the await must see the ringing flag (else its missed-call
                     // is lost and we'd set a stale flag after the call already ended).
-                    #[cfg(feature = "voip-runtime")]
+                    #[cfg(feature = "voip-control")]
                     let mut duplicate_active_group_offer = false;
-                    #[cfg(feature = "voip-runtime")]
+                    #[cfg(feature = "voip-control")]
                     let mut buffered_initial_group_controls = Vec::new();
-                    #[cfg(feature = "voip-runtime")]
+                    #[cfg(feature = "voip-control")]
                     if is_offer {
                         if let Some(group) = call.group.as_deref() {
-                            let mut session = wacore::voip::CallSession::new_incoming(
+                            let mut session = wacore::voip_control::CallSession::new_incoming(
                                 call.action.call_id(),
                                 call.from.clone(),
                                 call.action.call_creator().clone(),
@@ -260,7 +264,7 @@ impl StanzaHandler for CallHandler {
                     if is_offer && let Err(e) = send_offer_ack_receipt(&client, &call).await {
                         warn!("call: failed to send offer ack receipt: {e}");
                     }
-                    #[cfg(feature = "voip-runtime")]
+                    #[cfg(feature = "voip-control")]
                     if let CallAction::PreAccept { audio, .. } | CallAction::Accept { audio, .. } =
                         &call.action
                         && !audio.is_empty()
@@ -310,9 +314,9 @@ impl StanzaHandler for CallHandler {
                     }
                     // Defaults to Unknown, which is "the peer said nothing" and resets nothing:
                     // a `<preaccept>`/`<accept>` we never parsed must not look like a refusal.
-                    #[cfg(feature = "voip-runtime")]
+                    #[cfg(feature = "voip-control")]
                     let mut peer_mlow_bit = CapabilityBit::Unknown;
-                    #[cfg(feature = "voip-runtime")]
+                    #[cfg(feature = "voip-control")]
                     if matches!(
                         &call.action,
                         CallAction::PreAccept { .. } | CallAction::Accept { .. }
@@ -398,7 +402,7 @@ impl StanzaHandler for CallHandler {
                     // base callee LID, but a companion answers from `:N` and encrypts under its own
                     // device id; without this every inbound frame decrypts to garbage. One-shot, and a
                     // no-op for an incoming call or a call we aren't the caller of (no sender registered).
-                    #[cfg(feature = "voip-runtime")]
+                    #[cfg(feature = "voip-control")]
                     if let CallAction::Accept { .. } = &call.action {
                         let sender = routed_call_sender(&call);
                         // Record the device that answered so a later <terminate> targets it (call
@@ -434,10 +438,10 @@ impl StanzaHandler for CallHandler {
                             .peer_selected_audio_codec(call.action.call_id(), peer_mlow_bit);
                         client.call_registry().send_rekey(
                             call.action.call_id(),
-                            wacore::voip::driver::PeerAnswer {
-                                answering_lid: sender.to_string(),
-                                audio_codec,
-                            },
+                            wacore::voip_control::control::PeerAnswer::builder()
+                                .answering_lid(sender.to_string())
+                                .maybe_audio_codec(audio_codec)
+                                .build(),
                         );
                         if let Some(generation) =
                             client.call_registry().generation_of(call.action.call_id())
@@ -453,7 +457,7 @@ impl StanzaHandler for CallHandler {
                     }
                     // Caller-side multi-device dismiss: when one of the callee's devices accepts or
                     // rejects an outbound call of ours, tell the rest to stop ringing.
-                    #[cfg(feature = "voip-runtime")]
+                    #[cfg(feature = "voip-control")]
                     dismiss_outgoing_siblings(&client, &call).await;
                     // A <terminate> for a call that was still ringing (an incoming offer we never
                     // answered) gets a terminal outcome. We mirror WA Web's
@@ -464,7 +468,7 @@ impl StanzaHandler for CallHandler {
                     // answered, outgoing, or already-terminated call, so we never misfire for our own
                     // outgoing call or a duplicate terminate; it still consumes the flag on any reason.
                     // Decided BEFORE terminate_call below.
-                    #[cfg(feature = "voip-runtime")]
+                    #[cfg(feature = "voip-control")]
                     if let CallAction::Terminate {
                         call_id,
                         call_creator,
@@ -484,7 +488,7 @@ impl StanzaHandler for CallHandler {
                             )
                             .await;
                     }
-                    #[cfg(feature = "voip-runtime")]
+                    #[cfg(feature = "voip-control")]
                     if let CallAction::Terminate { reason, .. } = &call.action
                         && client.call_registry().take_ringing(call.action.call_id())
                     {
@@ -524,7 +528,7 @@ impl StanzaHandler for CallHandler {
                     // reject speaks for one invited participant. Neither tears down the registered
                     // call; authoritative timeout/terminate or the group roster owns the
                     // corresponding final state.
-                    #[cfg(feature = "voip-runtime")]
+                    #[cfg(feature = "voip-control")]
                     if let CallAction::Terminate { .. } = &call.action
                         && let Some(generation) = group_transition_generation
                     {
@@ -541,11 +545,11 @@ impl StanzaHandler for CallHandler {
                     {
                         crate::voip::facade::terminate_call(&client, call.action.call_id());
                     }
-                    #[cfg(feature = "voip-runtime")]
+                    #[cfg(feature = "voip-control")]
                     let mut dispatch_call = !duplicate_active_group_offer;
-                    #[cfg(not(feature = "voip-runtime"))]
+                    #[cfg(not(feature = "voip-control"))]
                     let dispatch_call = true;
-                    #[cfg(feature = "voip-runtime")]
+                    #[cfg(feature = "voip-control")]
                     match &call.action {
                         CallAction::GroupUpdate { update }
                             if client
@@ -745,7 +749,7 @@ impl StanzaHandler for CallHandler {
                     // suppress the router's generic one — an untyped ack makes the upgrade
                     // requester assume failure and revert after ~5s. Serialize event publication,
                     // then expose the state only after that ack commits it.
-                    #[cfg(feature = "voip-runtime")]
+                    #[cfg(feature = "voip-control")]
                     if let CallAction::VideoState {
                         state, orientation, ..
                     } = &call.action
@@ -1039,7 +1043,7 @@ impl StanzaHandler for CallHandler {
                             .event_bus
                             .dispatch(Event::IncomingCall(Box::new(call)));
                     }
-                    #[cfg(feature = "voip-runtime")]
+                    #[cfg(feature = "voip-control")]
                     replay_initial_group_controls(&client, buffered_initial_group_controls).await;
                 }
             }
@@ -1072,7 +1076,7 @@ fn send_node_boxed(
     Box::pin(client.send_node(node))
 }
 
-#[cfg(feature = "voip-runtime")]
+#[cfg(feature = "voip-control")]
 async fn apply_current_group_control(client: &Client, call: &IncomingCall) -> bool {
     let registry = client.call_registry();
     let call_id = call.action.call_id();
@@ -1090,7 +1094,7 @@ async fn apply_current_group_control(client: &Client, call: &IncomingCall) -> bo
     apply_group_control(client, call, generation).await
 }
 
-#[cfg(feature = "voip-runtime")]
+#[cfg(feature = "voip-control")]
 /// Announce a rotation the app set while the call was still ringing.
 ///
 /// A video-from-start offer carries `device_orientation="0"`, and its caller
@@ -1098,7 +1102,7 @@ async fn apply_current_group_control(client: &Client, call: &IncomingCall) -> bo
 /// and the answer would never reach the peer: while ringing there is no call
 /// entry on their side to apply one against. Upright needs no stanza — that is
 /// what the offer already said.
-#[cfg(feature = "voip-runtime")]
+#[cfg(feature = "voip-control")]
 async fn announce_orientation_on_accept(
     client: &Arc<Client>,
     call_id: &str,
@@ -1137,7 +1141,7 @@ async fn announce_orientation_on_accept(
     }
 }
 
-#[cfg(feature = "voip-runtime")]
+#[cfg(feature = "voip-control")]
 async fn apply_current_decrypted_group_epoch(
     client: &Client,
     rekey: &GroupCallEncRekey,
@@ -1171,7 +1175,7 @@ async fn apply_current_decrypted_group_epoch(
     commit_decrypted_group_epoch(client, rekey, generation, raw_epoch);
 }
 
-#[cfg(feature = "voip-runtime")]
+#[cfg(feature = "voip-control")]
 async fn apply_current_waiting_room_update(
     client: &Client,
     room: &wacore::types::group_call::WaitingRoom,
@@ -1189,7 +1193,7 @@ async fn apply_current_waiting_room_update(
     apply_waiting_room_update(client, room, call, generation)
 }
 
-#[cfg(feature = "voip-runtime")]
+#[cfg(feature = "voip-control")]
 fn apply_waiting_room_update(
     client: &Client,
     room: &wacore::types::group_call::WaitingRoom,
@@ -1230,7 +1234,7 @@ fn apply_waiting_room_update(
     }
 }
 
-#[cfg(feature = "voip-runtime")]
+#[cfg(feature = "voip-control")]
 async fn replay_initial_group_controls(client: &Client, controls: Vec<IncomingCall>) {
     for call in controls {
         if apply_current_group_control(client, &call).await {
@@ -1242,7 +1246,7 @@ async fn replay_initial_group_controls(client: &Client, controls: Vec<IncomingCa
     }
 }
 
-#[cfg(feature = "voip-runtime")]
+#[cfg(feature = "voip-control")]
 async fn apply_group_control(client: &Client, call: &IncomingCall, generation: u64) -> bool {
     let registry = client.call_registry();
     let sender = routed_call_sender(call);
@@ -1371,7 +1375,7 @@ async fn apply_group_control(client: &Client, call: &IncomingCall, generation: u
     }
 }
 
-#[cfg(feature = "voip-runtime")]
+#[cfg(feature = "voip-control")]
 fn commit_decrypted_group_epoch(
     client: &Client,
     rekey: &GroupCallEncRekey,
@@ -1392,7 +1396,7 @@ fn commit_decrypted_group_epoch(
     }
 }
 
-#[cfg(feature = "voip-runtime")]
+#[cfg(feature = "voip-control")]
 async fn decrypt_group_epoch(
     client: &Client,
     rekey: &GroupCallEncRekey,
@@ -1428,7 +1432,7 @@ async fn decrypt_group_epoch(
     Ok(raw_epoch)
 }
 
-#[cfg(feature = "voip-runtime")]
+#[cfg(feature = "voip-control")]
 fn validate_group_epoch_key(raw_epoch: &[u8]) -> anyhow::Result<()> {
     if raw_epoch.len() != 32 {
         anyhow::bail!("call key must contain exactly 32 bytes");
@@ -1436,7 +1440,7 @@ fn validate_group_epoch_key(raw_epoch: &[u8]) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(feature = "voip-runtime")]
+#[cfg(feature = "voip-control")]
 fn routed_call_sender(call: &IncomingCall) -> Jid {
     call.participant.as_ref().unwrap_or(&call.from).clone()
 }
@@ -1469,7 +1473,7 @@ async fn send_offer_ack_receipt(client: &Client, call: &IncomingCall) -> anyhow:
 /// could not decrypt the offer (its registration changed device-side, observed with registration
 /// bytes on the reject), so it decided nothing for the callee either. Any other reason - including
 /// none - is the callee's own decision and ends the call.
-#[cfg(feature = "voip-runtime")]
+#[cfg(feature = "voip-control")]
 fn reject_is_device_busy(action: &CallAction) -> bool {
     matches!(
         action,
@@ -1479,7 +1483,7 @@ fn reject_is_device_busy(action: &CallAction) -> bool {
     )
 }
 
-#[cfg(feature = "voip-runtime")]
+#[cfg(feature = "voip-control")]
 async fn dismiss_outgoing_siblings(client: &Client, call: &IncomingCall) {
     let reason = match &call.action {
         CallAction::Accept { .. } => TERMINATE_REASON_ACCEPTED_ELSEWHERE,
@@ -1538,7 +1542,7 @@ async fn dismiss_outgoing_siblings(client: &Client, call: &IncomingCall) {
     }
 }
 
-#[cfg(feature = "voip-runtime")]
+#[cfg(feature = "voip-control")]
 async fn dismiss_incompatible_group_invitee(client: &Client, call: &IncomingCall) {
     let target = routed_call_sender(call);
     if target.server == Server::Call {
@@ -1566,7 +1570,7 @@ async fn dismiss_incompatible_group_invitee(client: &Client, call: &IncomingCall
 
 /// Whether two JIDs name the same device: user + server + device id. Excludes `agent`/`integrator`,
 /// representation details that can differ between the usync device-list and a stanza's `from`.
-#[cfg(feature = "voip-runtime")]
+#[cfg(feature = "voip-control")]
 fn same_device(a: &Jid, b: &Jid) -> bool {
     a.user == b.user && a.server == b.server && a.device == b.device
 }
@@ -1577,10 +1581,10 @@ mod tests {
     use crate::test_utils::node_to_owned_ref;
     use std::sync::Arc;
     use wacore::types::events::{ChannelEventHandler, Event};
-    #[cfg(feature = "voip-runtime")]
+    #[cfg(feature = "voip-control")]
     use wacore::types::group_call::{GroupCallParticipant, GroupCallUpdate};
-    #[cfg(feature = "voip-runtime")]
-    use wacore::voip::video_control_channel;
+    #[cfg(feature = "voip-control")]
+    use wacore::voip_control::control::video_control_channel;
     use wacore_binary::builder::NodeBuilder;
     use wacore_binary::{Jid, Server};
 
@@ -1588,7 +1592,7 @@ mod tests {
         Jid::new("111111111111111", Server::Lid)
     }
 
-    #[cfg(feature = "voip-runtime")]
+    #[cfg(feature = "voip-control")]
     fn next_legacy_event(
         events: &async_channel::Receiver<CallEvent>,
     ) -> Result<CallEvent, async_channel::TryRecvError> {
@@ -1616,7 +1620,7 @@ mod tests {
             .build()
     }
 
-    #[cfg(feature = "voip-runtime")]
+    #[cfg(feature = "voip-control")]
     #[test]
     fn routed_call_sender_prefers_participant_metadata() {
         let wrapper = Jid::new("GROUP-CALL", Server::Call);
@@ -1636,7 +1640,7 @@ mod tests {
         assert_eq!(routed_call_sender(&call), participant);
     }
 
-    #[cfg(feature = "voip-runtime")]
+    #[cfg(feature = "voip-control")]
     #[test]
     fn group_epoch_keys_require_the_exact_protocol_length() {
         assert!(validate_group_epoch_key(&[0; 32]).is_ok());
@@ -1644,11 +1648,11 @@ mod tests {
         assert!(validate_group_epoch_key(&[0; 33]).is_err());
     }
 
-    #[cfg(feature = "voip-runtime")]
+    #[cfg(feature = "voip-control")]
     #[tokio::test]
     async fn decrypted_epoch_is_committed_when_registration_overtakes_pending_buffering() {
         use wacore::types::group_call::GroupCallEncRekey;
-        use wacore::voip::CallSession;
+        use wacore::voip_control::CallSession;
 
         let client = make_client().await;
         let creator = fake_caller_lid();
@@ -1699,7 +1703,7 @@ mod tests {
             .remove_if_current(call_id, generation);
     }
 
-    #[cfg(feature = "voip-runtime")]
+    #[cfg(feature = "voip-control")]
     #[tokio::test]
     async fn waiting_room_update_rechecks_a_generation_published_during_registration() {
         let client = make_sending_client().await;
@@ -1707,7 +1711,7 @@ mod tests {
         let call_id = "CALL-LINK-RACE";
         let registry = client.call_registry();
         let generation = registry
-            .insert_call_link_checked(wacore::voip::CallSession::new_outgoing(
+            .insert_call_link_checked(wacore::voip_control::CallSession::new_outgoing(
                 call_id,
                 Jid::new(call_id, Server::Call),
                 creator.clone(),
@@ -1744,7 +1748,7 @@ mod tests {
         registry.remove_if_current(call_id, generation);
     }
 
-    #[cfg(feature = "voip-runtime")]
+    #[cfg(feature = "voip-control")]
     #[tokio::test]
     async fn typed_control_after_unknown_child_suppresses_the_generic_ack() {
         let client = make_sending_client().await;
@@ -1783,11 +1787,12 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "voip-runtime")]
+    #[cfg(feature = "voip-control")]
     #[tokio::test]
     async fn routed_group_control_rejects_sender_outside_authoritative_roster() {
         use wacore::types::group_call::{GroupCallParticipant, GroupCallUpdate};
-        use wacore::voip::{CallSession, GroupStateApply};
+        use wacore::voip_control::CallSession;
+        use wacore::voip_control::group::GroupStateApply;
 
         let client = make_sending_client().await;
         let creator = fake_caller_lid();
@@ -1885,11 +1890,12 @@ mod tests {
         registry.remove_if_current("GROUP-CALL", generation);
     }
 
-    #[cfg(feature = "voip-runtime")]
+    #[cfg(feature = "voip-control")]
     #[tokio::test]
     async fn remote_screen_share_start_is_rejected_for_an_audio_only_group() {
         use wacore::types::group_call::{GroupCallParticipant, GroupCallUpdate};
-        use wacore::voip::{CallSession, GroupStateApply};
+        use wacore::voip_control::CallSession;
+        use wacore::voip_control::group::GroupStateApply;
 
         let client = make_sending_client().await;
         let creator = fake_caller_lid();
@@ -1965,11 +1971,13 @@ mod tests {
         registry.remove_if_current(call_id, generation);
     }
 
-    #[cfg(feature = "voip-runtime")]
+    #[cfg(feature = "voip-control")]
     #[tokio::test]
     async fn routed_group_video_is_participant_scoped_and_canonicalizes_a_pn_alias() {
         use wacore::types::group_call::{GroupCallParticipant, GroupCallUpdate};
-        use wacore::voip::{CallEvent, CallSession, GroupStateApply, VideoControl};
+        use wacore::voip_control::control::VideoControl;
+        use wacore::voip_control::group::GroupStateApply;
+        use wacore::voip_control::{CallEvent, CallSession};
 
         let client = make_sending_client().await;
         let creator = fake_caller_lid();
@@ -2118,11 +2126,13 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "voip-runtime")]
+    #[cfg(feature = "voip-control")]
     #[tokio::test]
     async fn group_video_reauthorizes_the_sender_after_the_typed_ack() {
         use wacore::types::group_call::{GroupCallParticipant, GroupCallUpdate};
-        use wacore::voip::{CallEvent, CallSession, GroupStateApply, VideoControl};
+        use wacore::voip_control::control::VideoControl;
+        use wacore::voip_control::group::GroupStateApply;
+        use wacore::voip_control::{CallEvent, CallSession};
 
         let (client, send_started, release_send) = make_blocking_sending_client().await;
         let (handler, global_rx) = ChannelEventHandler::new();
@@ -2229,13 +2239,14 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "voip-runtime")]
+    #[cfg(feature = "voip-control")]
     #[tokio::test]
     async fn routed_group_snapshots_reject_non_creator_roster_writes_and_outsiders() {
         use wacore::types::group_call::{
             CallLinkMedia, GroupCallParticipant, GroupCallUpdate, WaitingRoom,
         };
-        use wacore::voip::{CallSession, GroupStateApply};
+        use wacore::voip_control::CallSession;
+        use wacore::voip_control::group::GroupStateApply;
 
         let client = make_sending_client().await;
         let creator = fake_caller_lid();
@@ -2375,10 +2386,10 @@ mod tests {
         registry.remove_if_current("GROUP-CALL", generation);
     }
 
-    #[cfg(feature = "voip-runtime")]
+    #[cfg(feature = "voip-control")]
     #[tokio::test]
     async fn queued_group_transition_cannot_commit_to_a_replacement_generation() {
-        use wacore::voip::CallSession;
+        use wacore::voip_control::CallSession;
 
         let client = make_client().await;
         let call_id = "GROUP-LOCK-GENERATION";
@@ -2447,12 +2458,12 @@ mod tests {
         registry.remove_if_current(call_id, replacement);
     }
 
-    #[cfg(feature = "voip-runtime")]
+    #[cfg(feature = "voip-control")]
     fn active_group_offer_stanza() -> wacore_binary::Node {
         active_group_offer_stanza_with_limit("32")
     }
 
-    #[cfg(feature = "voip-runtime")]
+    #[cfg(feature = "voip-control")]
     fn active_group_offer_stanza_with_limit(connected_limit: &str) -> wacore_binary::Node {
         let caller = fake_caller_lid();
         NodeBuilder::new("call")
@@ -2489,7 +2500,7 @@ mod tests {
             .build()
     }
 
-    #[cfg(feature = "voip-runtime")]
+    #[cfg(feature = "voip-control")]
     fn active_group_update_stanza(transaction_id: u32) -> wacore_binary::Node {
         let caller = fake_caller_lid();
         NodeBuilder::new("call")
@@ -2518,11 +2529,12 @@ mod tests {
             .build()
     }
 
-    #[cfg(feature = "voip-runtime")]
+    #[cfg(feature = "voip-control")]
     #[tokio::test]
     async fn rekey_group_update_is_acknowledged_before_epoch_fanout() {
         use wacore::types::group_call::GroupCallUpdate;
-        use wacore::voip::{CallSession, GroupStateApply};
+        use wacore::voip_control::CallSession;
+        use wacore::voip_control::group::GroupStateApply;
 
         let (client, send_started, release_send) = make_blocking_sending_client().await;
         client.set_connected_for_test(true);
@@ -2611,7 +2623,7 @@ mod tests {
         registry.remove_if_current(call_id, generation);
     }
 
-    #[cfg(feature = "voip-runtime")]
+    #[cfg(feature = "voip-control")]
     #[tokio::test]
     async fn initial_group_control_waits_in_a_bounded_buffer_for_its_offer() {
         let client = make_sending_client().await;
@@ -2654,7 +2666,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "voip-runtime")]
+    #[cfg(feature = "voip-control")]
     #[tokio::test]
     async fn group_updated_event_carries_the_committed_inherited_snapshot() {
         let client = make_sending_client().await;
@@ -2701,8 +2713,11 @@ mod tests {
             .participants(vec![creator_participant.clone()])
             .relay(relay.clone())
             .build();
-        let mut session =
-            wacore::voip::CallSession::new_outgoing(call_id, creator.clone(), creator.clone());
+        let mut session = wacore::voip_control::CallSession::new_outgoing(
+            call_id,
+            creator.clone(),
+            creator.clone(),
+        );
         session.group = Some(initial);
         let generation = registry
             .insert_group_checked(session)
@@ -2749,12 +2764,12 @@ mod tests {
     }
 
     /// A client whose sends land on a counting transport (so ack sends succeed and can be counted).
-    #[cfg(feature = "voip-runtime")]
+    #[cfg(feature = "voip-control")]
     async fn make_sending_client() -> Arc<Client> {
         make_sending_client_with_failure_after(None).await.0
     }
 
-    #[cfg(feature = "voip-runtime")]
+    #[cfg(feature = "voip-control")]
     async fn make_sending_client_with_failure_after(
         failure_after: Option<usize>,
     ) -> (Arc<Client>, Arc<std::sync::atomic::AtomicUsize>) {
@@ -2794,7 +2809,7 @@ mod tests {
         (client, sends)
     }
 
-    #[cfg(feature = "voip-runtime")]
+    #[cfg(feature = "voip-control")]
     async fn make_blocking_sending_client() -> (
         Arc<Client>,
         async_channel::Receiver<()>,
@@ -2834,7 +2849,7 @@ mod tests {
         (client, started_rx, release_tx)
     }
 
-    #[cfg(feature = "voip-runtime")]
+    #[cfg(feature = "voip-control")]
     fn video_stanza(state: &str) -> wacore_binary::Node {
         NodeBuilder::new("call")
             .attr("from", fake_caller_lid())
@@ -2849,12 +2864,12 @@ mod tests {
             .build()
     }
 
-    #[cfg(feature = "voip-runtime")]
+    #[cfg(feature = "voip-control")]
     fn audio_selection_stanza(rate: &str) -> wacore_binary::Node {
         audio_selection_stanza_with_leading_children(rate, Vec::new())
     }
 
-    #[cfg(feature = "voip-runtime")]
+    #[cfg(feature = "voip-control")]
     fn audio_selection_stanza_with_leading_children(
         rate: &str,
         mut leading: Vec<wacore_binary::Node>,
@@ -2883,20 +2898,20 @@ mod tests {
             .build()
     }
 
-    #[cfg(feature = "voip-runtime")]
+    #[cfg(feature = "voip-control")]
     fn register_native_opus_call(
         client: &Client,
         ring_devices: Vec<Jid>,
     ) -> (async_channel::Receiver<CallEvent>, u64) {
-        use wacore::voip::{AudioFormat, CallEvent};
+        use wacore::voip_control::CallEvent;
 
         let registry = client.call_registry();
-        let mut session = wacore::voip::CallSession::new_outgoing(
+        let mut session = wacore::voip_control::CallSession::new_outgoing(
             "CALL-ID-0001",
             fake_caller_lid(),
             fake_caller_lid(),
         );
-        session.audio_format = Some(AudioFormat::OPUS_16KHZ_60MS);
+        session.audio_format = Some(wacore::voip_control::MediaAudioFormat::OPUS_16KHZ_60MS);
         session.ring_devices = ring_devices;
         let generation = registry.insert(session);
         assert!(
@@ -2919,10 +2934,10 @@ mod tests {
         (event_rx, generation)
     }
 
-    #[cfg(feature = "voip-runtime")]
+    #[cfg(feature = "voip-control")]
     #[tokio::test]
     async fn incompatible_audio_selection_emits_event_and_terminates_call() {
-        use wacore::voip::CallEvent;
+        use wacore::voip_control::CallEvent;
 
         let (client, sends) = make_sending_client_with_failure_after(None).await;
         let accepting = fake_caller_lid();
@@ -2952,11 +2967,12 @@ mod tests {
         assert!(!cancelled);
     }
 
-    #[cfg(feature = "voip-runtime")]
+    #[cfg(feature = "voip-control")]
     #[tokio::test]
     async fn incompatible_group_invitee_does_not_terminate_the_active_call() {
         use wacore::types::group_call::{GroupCallParticipant, GroupCallUpdate};
-        use wacore::voip::{CallEvent, GroupStateApply};
+        use wacore::voip_control::CallEvent;
+        use wacore::voip_control::group::GroupStateApply;
 
         let (client, sends) = make_sending_client_with_failure_after(None).await;
         let (event_rx, generation) = register_native_opus_call(&client, Vec::new());
@@ -3045,7 +3061,7 @@ mod tests {
             .remove_if_current("CALL-ID-0001", generation);
     }
 
-    #[cfg(feature = "voip-runtime")]
+    #[cfg(feature = "voip-control")]
     #[tokio::test]
     async fn compatible_audio_selection_keeps_call_active() {
         let (client, sends) = make_sending_client_with_failure_after(None).await;
@@ -3080,7 +3096,7 @@ mod tests {
         assert!(!cancelled);
     }
 
-    #[cfg(feature = "voip-runtime")]
+    #[cfg(feature = "voip-control")]
     #[tokio::test]
     async fn accept_capability_follows_the_forward_compatible_typed_action() {
         let client = make_sending_client().await;
@@ -3110,7 +3126,7 @@ mod tests {
             .remove_if_current("CALL-ID-0001", generation);
     }
 
-    #[cfg(feature = "voip-runtime")]
+    #[cfg(feature = "voip-control")]
     #[tokio::test]
     async fn capabilityless_accept_retains_the_same_devices_preaccept_capability() {
         let client = make_sending_client().await;
@@ -3175,11 +3191,11 @@ mod tests {
             .remove_if_current("CALL-ID-0001", generation);
     }
 
-    #[cfg(feature = "voip-runtime")]
+    #[cfg(feature = "voip-control")]
     /// A rotation set while the call was ringing has to reach the device that
     /// answered. `call_creator` is our own LID on an outgoing call, so a stanza
     /// addressed there comes straight back to us and the callee stays upright.
-    #[cfg(feature = "voip-runtime")]
+    #[cfg(feature = "voip-control")]
     #[tokio::test]
     async fn the_deferred_orientation_goes_to_the_device_that_answered() {
         let client = make_sending_client().await;
@@ -3244,15 +3260,16 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "voip-runtime")]
+    #[cfg(feature = "voip-control")]
     #[tokio::test]
     async fn call_scoped_accept_records_the_routed_participant_device() {
         let client = make_sending_client().await;
         let (_event_rx, generation) = register_native_opus_call(&client, Vec::new());
-        let (rekey_tx, rekey_rx) = async_channel::bounded(1);
-        client
+        let rekey_rx = client
             .call_registry()
-            .set_rekey_sender("CALL-ID-0001", generation, rekey_tx);
+            .resident_session("CALL-ID-0001", generation)
+            .and_then(|session| session.take_rekey_receiver())
+            .expect("the resident session owns a rekey receiver");
         let participant = fake_caller_lid().with_device(4);
         let accept = NodeBuilder::new("call")
             .attr("from", Jid::new("CALL-ID-0001", Server::Call))
@@ -3314,8 +3331,11 @@ mod tests {
             .remove_if_current("CALL-ID-0001", generation);
     }
 
-    #[cfg(feature = "voip-runtime")]
-    async fn begin_local_upgrade(registry: &wacore::voip::CallRegistry, generation: u64) {
+    #[cfg(feature = "voip-control")]
+    async fn begin_local_upgrade(
+        registry: &wacore::voip_control::registry::CallRegistry,
+        generation: u64,
+    ) {
         let transition_lock = registry
             .video_transition_lock("CALL-ID-0001", generation)
             .expect("active call");
@@ -3329,14 +3349,14 @@ mod tests {
 
     // A <call><video> must be acked with the TYPED <ack class="call" type="video"> and the
     // generic router ack suppressed — an untyped ack makes the upgrade requester revert ~5s in.
-    #[cfg(feature = "voip-runtime")]
+    #[cfg(feature = "voip-control")]
     #[tokio::test]
     async fn video_state_sends_typed_ack_and_cancels_generic() {
-        use wacore::voip::CallEvent;
+        use wacore::voip_control::CallEvent;
 
         let client = make_sending_client().await;
         let registry = client.call_registry();
-        let generation = registry.insert(wacore::voip::CallSession::new_incoming(
+        let generation = registry.insert(wacore::voip_control::CallSession::new_incoming(
             "CALL-ID-0001",
             fake_caller_lid(),
             fake_caller_lid(),
@@ -3370,14 +3390,14 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "voip-runtime")]
+    #[cfg(feature = "voip-control")]
     #[tokio::test]
     async fn video_state_is_not_visible_before_typed_ack_completes() {
-        use wacore::voip::CallEvent;
+        use wacore::voip_control::CallEvent;
 
         let (client, send_started, release_send) = make_blocking_sending_client().await;
         let registry = client.call_registry();
-        let generation = registry.insert(wacore::voip::CallSession::new_incoming(
+        let generation = registry.insert(wacore::voip_control::CallSession::new_incoming(
             "CALL-ID-0001",
             fake_caller_lid(),
             fake_caller_lid(),
@@ -3426,14 +3446,14 @@ mod tests {
         ));
     }
 
-    #[cfg(feature = "voip-runtime")]
+    #[cfg(feature = "voip-control")]
     #[tokio::test]
     async fn cancelled_peer_request_invalidates_its_acceptance_token() {
-        use wacore::voip::CallEvent;
+        use wacore::voip_control::CallEvent;
 
         let client = make_sending_client().await;
         let registry = client.call_registry();
-        let generation = registry.insert(wacore::voip::CallSession::new_incoming(
+        let generation = registry.insert(wacore::voip_control::CallSession::new_incoming(
             "CALL-ID-0001",
             fake_caller_lid(),
             fake_caller_lid(),
@@ -3489,14 +3509,14 @@ mod tests {
         ));
     }
 
-    #[cfg(feature = "voip-runtime")]
+    #[cfg(feature = "voip-control")]
     #[tokio::test]
     async fn video_transition_stays_serialized_through_enabled_announcement() {
-        use wacore::voip::CallEvent;
+        use wacore::voip_control::CallEvent;
 
         let (client, send_started, release_send) = make_blocking_sending_client().await;
         let registry = client.call_registry();
-        let generation = registry.insert(wacore::voip::CallSession::new_incoming(
+        let generation = registry.insert(wacore::voip_control::CallSession::new_incoming(
             "CALL-ID-0001",
             fake_caller_lid(),
             fake_caller_lid(),
@@ -3539,17 +3559,18 @@ mod tests {
         assert!(registry.reserve_call_event("CALL-ID-0001").is_some());
     }
 
-    #[cfg(feature = "voip-runtime")]
+    #[cfg(feature = "voip-control")]
     #[tokio::test]
     async fn failed_enabled_announcement_rolls_back_the_video_upgrade() {
         use std::sync::atomic::{AtomicUsize, Ordering};
-        use wacore::voip::{CallEvent, VideoControl};
+        use wacore::voip_control::CallEvent;
+        use wacore::voip_control::control::VideoControl;
 
         let (client, sends) = make_sending_client_with_failure_after(Some(1)).await;
         let (global_handler, global_rx) = ChannelEventHandler::new();
         client.subscribe_handler(global_handler).detach();
         let registry = client.call_registry();
-        let generation = registry.insert(wacore::voip::CallSession::new_outgoing(
+        let generation = registry.insert(wacore::voip_control::CallSession::new_outgoing(
             "CALL-ID-0001",
             fake_caller_lid(),
             fake_caller_lid(),
@@ -3585,17 +3606,17 @@ mod tests {
         assert!(registry.reserve_call_event("CALL-ID-0001").is_some());
     }
 
-    #[cfg(feature = "voip-runtime")]
+    #[cfg(feature = "voip-control")]
     #[tokio::test]
     async fn video_state_does_not_mutate_a_same_id_replacement_after_ack_await() {
         use std::sync::atomic::{AtomicUsize, Ordering};
-        use wacore::voip::CallEvent;
+        use wacore::voip_control::CallEvent;
 
         let (client, send_started, release_send) = make_blocking_sending_client().await;
         let (global_handler, global_rx) = ChannelEventHandler::new();
         client.subscribe_handler(global_handler).detach();
         let registry = client.call_registry();
-        let stale_generation = registry.insert(wacore::voip::CallSession::new_incoming(
+        let stale_generation = registry.insert(wacore::voip_control::CallSession::new_incoming(
             "CALL-ID-0001",
             fake_caller_lid(),
             fake_caller_lid(),
@@ -3622,7 +3643,7 @@ mod tests {
                 _ = &mut handling => panic!("handler completed before the typed ack send"),
             }
 
-            let replacement = registry.insert(wacore::voip::CallSession::new_incoming(
+            let replacement = registry.insert(wacore::voip_control::CallSession::new_incoming(
                 "CALL-ID-0001",
                 fake_caller_lid(),
                 fake_caller_lid(),
@@ -3665,7 +3686,7 @@ mod tests {
     }
 
     // Non-video call actions keep the generic ack: `cancelled` must stay false.
-    #[cfg(feature = "voip-runtime")]
+    #[cfg(feature = "voip-control")]
     #[tokio::test]
     async fn non_video_actions_keep_the_generic_ack() {
         let client = make_sending_client().await;
@@ -3677,17 +3698,18 @@ mod tests {
 
     // The video state must reach the call's event stream (via the registry hook) with the
     // orientation, steer the plane (Enable on accept), and update the session's is_video flag.
-    #[cfg(feature = "voip-runtime")]
+    #[cfg(feature = "voip-control")]
     #[tokio::test]
     async fn video_state_forwards_event_and_steers_the_plane() {
         use wacore::types::call::VideoState;
-        use wacore::voip::{CallEvent, VideoControl};
+        use wacore::voip_control::CallEvent;
+        use wacore::voip_control::control::VideoControl;
 
         let client = make_sending_client().await;
         let (global_handler, global_rx) = ChannelEventHandler::new();
         client.subscribe_handler(global_handler).detach();
         let registry = client.call_registry();
-        let session = wacore::voip::CallSession::new_incoming(
+        let session = wacore::voip_control::CallSession::new_incoming(
             "CALL-ID-0001",
             fake_caller_lid(),
             fake_caller_lid(),
@@ -3769,17 +3791,17 @@ mod tests {
 
     // A peer that REJECTS or CANCELS an upgrade we started must fully release our local video: the
     // registered teardown hook runs (so the camera feed stops) and the session flag clears.
-    #[cfg(feature = "voip-runtime")]
+    #[cfg(feature = "voip-control")]
     #[tokio::test]
     async fn refused_upgrade_runs_local_video_teardown() {
         use std::sync::atomic::{AtomicUsize, Ordering};
-        use wacore::voip::CallEvent;
+        use wacore::voip_control::CallEvent;
 
         for state in ["5", "8"] {
             // 5 = UpgradeReject, 8 = UpgradeCancel.
             let client = make_sending_client().await;
             let registry = client.call_registry();
-            let session = wacore::voip::CallSession::new_outgoing(
+            let session = wacore::voip_control::CallSession::new_outgoing(
                 "CALL-ID-0001",
                 fake_caller_lid(),
                 fake_caller_lid(),
@@ -3811,15 +3833,15 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "voip-runtime")]
+    #[cfg(feature = "voip-control")]
     #[tokio::test]
     async fn refused_upgrade_tears_down_when_typed_ack_send_fails() {
         use std::sync::atomic::{AtomicUsize, Ordering};
-        use wacore::voip::CallEvent;
+        use wacore::voip_control::CallEvent;
 
         let client = make_client().await;
         let registry = client.call_registry();
-        let session = wacore::voip::CallSession::new_outgoing(
+        let session = wacore::voip_control::CallSession::new_outgoing(
             "CALL-ID-0001",
             fake_caller_lid(),
             fake_caller_lid(),
@@ -3851,16 +3873,16 @@ mod tests {
         assert!(!registry.snapshot("CALL-ID-0001").expect("session").is_video);
     }
 
-    #[cfg(feature = "voip-runtime")]
+    #[cfg(feature = "voip-control")]
     #[tokio::test]
     async fn unacked_video_state_is_not_dispatched_globally() {
-        use wacore::voip::CallEvent;
+        use wacore::voip_control::CallEvent;
 
         let client = make_client().await;
         let (global_handler, global_rx) = ChannelEventHandler::new();
         client.subscribe_handler(global_handler).detach();
         let registry = client.call_registry();
-        let generation = registry.insert(wacore::voip::CallSession::new_incoming(
+        let generation = registry.insert(wacore::voip_control::CallSession::new_incoming(
             "CALL-ID-0001",
             fake_caller_lid(),
             fake_caller_lid(),
@@ -3888,14 +3910,15 @@ mod tests {
         assert!(ctl_rx.try_recv().is_err());
     }
 
-    #[cfg(feature = "voip-runtime")]
+    #[cfg(feature = "voip-control")]
     #[tokio::test]
     async fn committed_video_state_supersedes_diagnostics_when_event_queue_is_full() {
-        use wacore::voip::{CallEvent, VideoControl};
+        use wacore::voip_control::CallEvent;
+        use wacore::voip_control::control::VideoControl;
 
         let client = make_sending_client().await;
         let registry = client.call_registry();
-        let generation = registry.insert(wacore::voip::CallSession::new_incoming(
+        let generation = registry.insert(wacore::voip_control::CallSession::new_incoming(
             "CALL-ID-0001",
             fake_caller_lid(),
             fake_caller_lid(),
@@ -3950,11 +3973,11 @@ mod tests {
         assert!(seen, "IncomingCall event must be dispatched");
     }
 
-    #[cfg(feature = "voip-runtime")]
+    #[cfg(feature = "voip-control")]
     #[tokio::test]
     async fn active_group_offer_registers_ringing_session_before_dispatch() {
         use std::sync::atomic::Ordering;
-        use wacore::voip::CallPhase;
+        use wacore::voip_control::CallPhase;
 
         let (client, sends) = make_sending_client_with_failure_after(None).await;
         let (event_handler, event_rx) = ChannelEventHandler::new();
@@ -4005,7 +4028,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "voip-runtime")]
+    #[cfg(feature = "voip-control")]
     #[tokio::test]
     async fn invalid_initial_group_offer_is_not_registered_or_dispatched() {
         let client = make_sending_client().await;
@@ -4034,10 +4057,10 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "voip-runtime")]
+    #[cfg(feature = "voip-control")]
     #[tokio::test]
     async fn duplicate_group_offer_preserves_an_active_generation() {
-        use wacore::voip::CallPhase;
+        use wacore::voip_control::CallPhase;
 
         let client = make_sending_client().await;
         let mut cancelled = false;
@@ -4188,7 +4211,7 @@ mod tests {
     // device gets a per-device `<call to=DEVICE_JID id=..><terminate reason="accepted_elsewhere">`
     // (no <destination> block), and the rung set is consumed one-shot. A two-device callee keeps the
     // assertion to a single dismiss stanza the waiter can capture in full.
-    #[cfg(feature = "voip-runtime")]
+    #[cfg(feature = "voip-control")]
     #[tokio::test]
     async fn accept_dismisses_other_callee_device() {
         let (client, sends) = make_sending_client_with_failure_after(None).await;
@@ -4197,8 +4220,11 @@ mod tests {
         let (sibling, accepting) = (peer.with_device(1), peer.with_device(2));
 
         // Register the outbound call with its rung device set on the session (as place_call does).
-        let mut session =
-            wacore::voip::CallSession::new_outgoing("CALL-ID-0001", peer.clone(), creator.clone());
+        let mut session = wacore::voip_control::CallSession::new_outgoing(
+            "CALL-ID-0001",
+            peer.clone(),
+            creator.clone(),
+        );
         session.ring_devices = vec![sibling.clone(), accepting.clone()];
         client.call_registry().insert(session);
 
@@ -4262,7 +4288,7 @@ mod tests {
     // must neither tear the call down nor dismiss the siblings, or the primary phone's <preaccept>
     // (observed landing 190ms later) arrives at a call we already ended. Critically the one-shot
     // rung set must SURVIVE, so a later genuine accept still has siblings to dismiss.
-    #[cfg(feature = "voip-runtime")]
+    #[cfg(feature = "voip-control")]
     #[tokio::test]
     async fn busy_reject_keeps_the_call_and_the_rung_set() {
         let client = make_client().await;
@@ -4270,8 +4296,11 @@ mod tests {
         let creator = Jid::new("111111111111111", Server::Lid);
         let (busy_device, other) = (peer.with_device(1), peer.with_device(2));
 
-        let mut session =
-            wacore::voip::CallSession::new_outgoing("CALL-ID-0001", peer.clone(), creator.clone());
+        let mut session = wacore::voip_control::CallSession::new_outgoing(
+            "CALL-ID-0001",
+            peer.clone(),
+            creator.clone(),
+        );
         session.ring_devices = vec![busy_device.clone(), other.clone()];
         client.call_registry().insert(session);
 
@@ -4312,7 +4341,7 @@ mod tests {
     }
 
     // Per-device reject (see `reject_is_device_busy`): keeps the call and rung set.
-    #[cfg(feature = "voip-runtime")]
+    #[cfg(feature = "voip-control")]
     #[tokio::test]
     async fn enc_reject_keeps_the_call_and_the_rung_set() {
         let client = make_client().await;
@@ -4320,8 +4349,11 @@ mod tests {
         let creator = Jid::new("111111111111111", Server::Lid);
         let (stale_device, other) = (peer.with_device(75), peer.with_device(2));
 
-        let mut session =
-            wacore::voip::CallSession::new_outgoing("CALL-ID-0001", peer.clone(), creator.clone());
+        let mut session = wacore::voip_control::CallSession::new_outgoing(
+            "CALL-ID-0001",
+            peer.clone(),
+            creator.clone(),
+        );
         session.ring_devices = vec![stale_device.clone(), other.clone()];
         client.call_registry().insert(session);
 
@@ -4366,7 +4398,7 @@ mod tests {
 
     // The failure case for the above: a reject WITHOUT `reason="busy"` is the callee declining, and
     // must still tear the call down exactly as before.
-    #[cfg(feature = "voip-runtime")]
+    #[cfg(feature = "voip-control")]
     #[tokio::test]
     async fn reject_without_busy_still_ends_the_call() {
         let client = make_client().await;
@@ -4374,8 +4406,11 @@ mod tests {
         let creator = Jid::new("111111111111111", Server::Lid);
         let declining = peer.with_device(1);
 
-        let session =
-            wacore::voip::CallSession::new_outgoing("CALL-ID-0001", peer.clone(), creator.clone());
+        let session = wacore::voip_control::CallSession::new_outgoing(
+            "CALL-ID-0001",
+            peer.clone(),
+            creator.clone(),
+        );
         client.call_registry().insert(session);
 
         let reject = NodeBuilder::new("call")
@@ -4404,14 +4439,14 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "voip-runtime")]
+    #[cfg(feature = "voip-control")]
     #[tokio::test]
     async fn participant_reject_keeps_the_active_group_call() {
         let client = make_client().await;
         let creator = Jid::new("111111111111111", Server::Lid);
         let participant = Jid::new("222222222222222", Server::Lid);
         let call_id = "GROUP-CALL";
-        let mut session = wacore::voip::CallSession::new_outgoing(
+        let mut session = wacore::voip_control::CallSession::new_outgoing(
             call_id,
             Jid::new(call_id, Server::Call),
             creator.clone(),
@@ -4456,14 +4491,14 @@ mod tests {
             .remove_if_current(call_id, generation);
     }
 
-    #[cfg(feature = "voip-runtime")]
+    #[cfg(feature = "voip-control")]
     #[tokio::test]
     async fn participant_reject_keeps_a_pre_ack_outgoing_group_call() {
         let client = make_client().await;
         let creator = Jid::new("111111111111111", Server::Lid);
         let participant = Jid::new("222222222222222", Server::Lid);
         let call_id = "PRE-ACK-GROUP-CALL";
-        let session = wacore::voip::CallSession::new_outgoing(
+        let session = wacore::voip_control::CallSession::new_outgoing(
             call_id,
             Jid::new(call_id, Server::Call),
             creator.clone(),
@@ -4495,14 +4530,14 @@ mod tests {
             .remove_if_current(call_id, generation);
     }
 
-    #[cfg(feature = "voip-runtime")]
+    #[cfg(feature = "voip-control")]
     #[tokio::test]
     async fn only_the_creator_can_terminate_an_active_group_call() {
         let client = make_client().await;
         let creator = Jid::new("111111111111111", Server::Lid);
         let participant = Jid::new("222222222222222", Server::Lid).with_device(2);
         let call_id = "GROUP-CALL";
-        let mut session = wacore::voip::CallSession::new_outgoing(
+        let mut session = wacore::voip_control::CallSession::new_outgoing(
             call_id,
             Jid::new(call_id, Server::Call),
             creator.clone(),
@@ -4575,14 +4610,17 @@ mod tests {
 
     // A peer <terminate> for our call tears it down: the registry entry (and with it the media task)
     // is removed so CallHandle::wait_ended() resolves, instead of leaking until a relay timeout.
-    #[cfg(feature = "voip-runtime")]
+    #[cfg(feature = "voip-control")]
     #[tokio::test]
     async fn terminate_tears_down_the_call() {
         let client = make_client().await;
         let peer = Jid::new("222222222222222", Server::Lid);
         let creator = Jid::new("111111111111111", Server::Lid);
-        let session =
-            wacore::voip::CallSession::new_outgoing("CALL-ID-0001", peer.clone(), creator.clone());
+        let session = wacore::voip_control::CallSession::new_outgoing(
+            "CALL-ID-0001",
+            peer.clone(),
+            creator.clone(),
+        );
         client.call_registry().insert(session);
         assert!(
             client
@@ -4622,12 +4660,12 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "voip-runtime")]
+    #[cfg(feature = "voip-control")]
     fn terminate_stanza(from: Jid, call_creator: Jid, call_id: &str) -> wacore_binary::Node {
         terminate_stanza_reason(from, call_creator, call_id, None)
     }
 
-    #[cfg(feature = "voip-runtime")]
+    #[cfg(feature = "voip-control")]
     fn terminate_stanza_reason(
         from: Jid,
         call_creator: Jid,
@@ -4648,7 +4686,7 @@ mod tests {
             .build()
     }
 
-    #[cfg(feature = "voip-runtime")]
+    #[cfg(feature = "voip-control")]
     fn count_missed(rx: &async_channel::Receiver<Arc<Event>>, call_id: &str) -> usize {
         let mut n = 0;
         while let Ok(ev) = rx.try_recv() {
@@ -4665,7 +4703,7 @@ mod tests {
     // An incoming offer that rings and is never answered, then a peer <terminate>, surfaces exactly
     // one MissedCall(Remote) -- WA Web's missed-call outcome. The offer is what marks the call ringing;
     // a terminate with no preceding offer is an ended call, not a missed one.
-    #[cfg(feature = "voip-runtime")]
+    #[cfg(feature = "voip-control")]
     #[tokio::test]
     async fn unanswered_incoming_terminate_surfaces_missed_call() {
         let client = make_client().await;
@@ -4703,7 +4741,7 @@ mod tests {
 
     // A duplicate <terminate> for the same unanswered call must NOT re-fire a missed call: the ringing
     // flag is consumed one-shot by the first terminate.
-    #[cfg(feature = "voip-runtime")]
+    #[cfg(feature = "voip-control")]
     #[tokio::test]
     async fn duplicate_terminate_does_not_refire_missed_call() {
         let client = make_client().await;
@@ -4742,7 +4780,7 @@ mod tests {
     // A <terminate> for an OUTGOING call we placed must NOT surface a missed call: we never rang for
     // it, so it is an ended call, not a missed one. This is the regression the registry-absence gate
     // produced -- our own call's teardown looked identical to an unanswered incoming call.
-    #[cfg(feature = "voip-runtime")]
+    #[cfg(feature = "voip-control")]
     #[tokio::test]
     async fn outgoing_call_terminate_does_not_surface_missed_call() {
         let client = make_client().await;
@@ -4753,7 +4791,7 @@ mod tests {
         let creator = Jid::new("111111111111111", Server::Lid); // us, the caller
         client
             .call_registry()
-            .insert(wacore::voip::CallSession::new_outgoing(
+            .insert(wacore::voip_control::CallSession::new_outgoing(
                 "CALL-ID-OUT",
                 peer.clone(),
                 creator.clone(),
@@ -4784,7 +4822,7 @@ mod tests {
     // outcome: accepted_elsewhere -> AcceptedElsewhere and rejected_elsewhere -> Rejected, meaning
     // another of our devices took the call. A companion device that rang then receives the caller's
     // elsewhere-dismiss must surface CallEndedElsewhere with the matching outcome, NOT a MissedCall.
-    #[cfg(feature = "voip-runtime")]
+    #[cfg(feature = "voip-control")]
     #[tokio::test]
     async fn elsewhere_terminate_surfaces_call_ended_elsewhere_not_missed() {
         for (reason, expected) in [
@@ -4846,7 +4884,7 @@ mod tests {
 
     // A reason that IS a missed outcome (timeout) on a still-ringing call surfaces the missed call,
     // confirming the reason gate excludes only the elsewhere outcomes, not every reason.
-    #[cfg(feature = "voip-runtime")]
+    #[cfg(feature = "voip-control")]
     #[tokio::test]
     async fn timeout_terminate_surfaces_missed_call() {
         let client = make_client().await;
@@ -4887,7 +4925,7 @@ mod tests {
 
     // A call we locally declined must not later be recorded as missed: reject() consumes the ringing
     // flag, so a caller <terminate> that follows our <reject> reads as ended, not missed.
-    #[cfg(feature = "voip-runtime")]
+    #[cfg(feature = "voip-control")]
     #[tokio::test]
     async fn local_reject_then_caller_terminate_is_not_missed() {
         use async_trait::async_trait;
@@ -4962,7 +5000,7 @@ mod tests {
     // A call we answered must not later be recorded as missed: accepting registers the call (as
     // accept().start() -> spawn_call -> registry.insert does), which consumes the ringing flag, so a
     // caller <terminate> after we picked up reads as ended, not missed.
-    #[cfg(feature = "voip-runtime")]
+    #[cfg(feature = "voip-control")]
     #[tokio::test]
     async fn answered_call_then_caller_terminate_is_not_missed() {
         let client = make_client().await;
@@ -4986,7 +5024,7 @@ mod tests {
         let creator = fake_caller_lid();
         client
             .call_registry()
-            .insert(wacore::voip::CallSession::new_incoming(
+            .insert(wacore::voip_control::CallSession::new_incoming(
                 "CALL-ID-0001",
                 peer,
                 creator.clone(),

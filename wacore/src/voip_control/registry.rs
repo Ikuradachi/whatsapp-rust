@@ -14,18 +14,23 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_lock::Mutex as AsyncMutex;
-use portable_atomic::{AtomicBool, AtomicU64, AtomicUsize};
+use portable_atomic::{AtomicBool, AtomicU64};
 
 use crate::runtime::AbortHandle;
 use crate::types::call::{CallAction, IncomingCall, VideoState};
 use crate::types::group_call::{
     GroupCallDevice, GroupCallParticipant, GroupCallUpdate, ScreenShare, WaitingRoom,
 };
-use crate::voip::driver::{GroupControl, GroupRawEpoch, VideoControl, VideoControlSender};
-use crate::voip::engine::CallEvent;
-use crate::voip::group::{GroupCallState, GroupStateApply};
-use crate::voip::group_media::group_device_is_local;
-use crate::voip::session::{CallPhase, CallSession};
+use crate::voip_control::CallEvent;
+use crate::voip_control::control::{GroupControl, VideoControl};
+// Only `set_video_channels` names the sender, and it is test-only: an unconditional import
+// warns (and fails `-D warnings`) in every build without `test`/`test-util`.
+#[cfg(any(test, feature = "test-util"))]
+use crate::voip_control::control::VideoControlSender;
+use crate::voip_control::group::{GroupCallState, GroupStateApply, group_device_is_local};
+use crate::voip_control::resident_session::{NoMediaBackend, video_control_to_command};
+use crate::voip_control::{CallPhase, CallSession};
+use crate::voip_control::{MediaCommand, MediaSessionKey, VoipMediaBackend, VoipMediaSession};
 use wacore_binary::Jid;
 
 const MAX_PENDING_INITIAL_GROUP_CONTROLS: usize = 64;
@@ -36,8 +41,12 @@ const MAX_PENDING_INITIAL_GROUP_CONTROL_BYTES: usize = 1024 * 1024;
 /// global buffer indefinitely, while controls from an in-flight offer still survive reordering.
 const PENDING_INITIAL_GROUP_CONTROL_TTL: Duration = Duration::from_secs(10);
 const MAX_CALL_EVENT_QUEUE_BYTES: usize = 1024 * 1024;
-const MAX_GROUP_CONTROL_QUEUE_BYTES: usize = 1024 * 1024;
-const DEFAULT_CALL_EVENT_QUEUE_CAPACITY: usize = 64;
+#[cfg(test)]
+pub(crate) use crate::voip_control::control::MAX_GROUP_CONTROL_QUEUE_BYTES;
+pub(crate) use crate::voip_control::control::{
+    DEFAULT_CALL_EVENT_QUEUE_CAPACITY, GroupControlQueue,
+};
+
 /// Peer devices whose `<capability>` statement one call retains. A peer answers from one device;
 /// this is headroom for its siblings preaccepting first, and a bound on what an unsolicited stream
 /// of `<preaccept>`s can make this call allocate.
@@ -46,17 +55,11 @@ const MAX_RINGING_GROUP_CALLS: usize = 64;
 const MAX_RINGING_GROUP_CALL_BYTES: usize = 1024 * 1024;
 
 /// Identifies one peer video-upgrade request within one call generation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct VideoUpgradeToken {
-    generation: u64,
-    epoch: u64,
-}
-
-impl VideoUpgradeToken {
-    pub fn generation(self) -> u64 {
-        self.generation
-    }
-}
+///
+/// This is the neutral [`MediaVideoUpgradeToken`](crate::voip_control::MediaVideoUpgradeToken) under
+/// its historical name: one type, so the token the signaling handler mints and the token the public
+/// event carries cannot drift.
+pub use crate::voip_control::MediaVideoUpgradeToken as VideoUpgradeToken;
 
 /// Result of applying a committed peer video-state transition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -133,127 +136,24 @@ impl Drop for EndedNotify {
     }
 }
 
-#[derive(Clone)]
-struct CallEventQueue {
-    tx: async_channel::Sender<CallEvent>,
-    max_payload_bytes: Arc<AtomicUsize>,
-}
-
-impl CallEventQueue {
-    fn new(tx: async_channel::Sender<CallEvent>) -> Self {
-        Self {
-            tx,
-            max_payload_bytes: Arc::new(AtomicUsize::new(0)),
-        }
-    }
-
-    fn force_send(&self, event: CallEvent) -> bool {
-        let payload_bytes = event.heap_bytes();
-        let queue_capacity = self
-            .tx
-            .capacity()
-            .unwrap_or(DEFAULT_CALL_EVENT_QUEUE_CAPACITY)
-            .max(1);
-        let max_event_bytes = MAX_CALL_EVENT_QUEUE_BYTES / queue_capacity;
-        if size_of::<CallEvent>().saturating_add(payload_bytes) > max_event_bytes {
-            return false;
-        }
-        self.max_payload_bytes
-            .fetch_max(payload_bytes, Ordering::Relaxed);
-        force_send_call_event(&self.tx, event)
-    }
-
-    fn retained_bytes(&self) -> usize {
-        self.tx.len().saturating_mul(
-            size_of::<CallEvent>().saturating_add(self.max_payload_bytes.load(Ordering::Relaxed)),
-        )
-    }
-}
-
-#[derive(Clone)]
-struct GroupControlQueue {
-    tx: async_channel::Sender<GroupControl>,
-    max_payload_bytes: Arc<AtomicUsize>,
-}
-
-impl GroupControlQueue {
-    fn new(tx: async_channel::Sender<GroupControl>) -> Self {
-        Self {
-            tx,
-            max_payload_bytes: Arc::new(AtomicUsize::new(0)),
-        }
-    }
-
-    fn retained_bytes(&self) -> usize {
-        self.tx.len().saturating_mul(
-            size_of::<GroupControl>()
-                .saturating_add(self.max_payload_bytes.load(Ordering::Relaxed)),
-        )
-    }
-
-    fn accepts(&self, control: &GroupControl) -> bool {
-        Self::accepts_with_capacity(control, self.tx.capacity().unwrap_or(1))
-    }
-
-    fn accepts_with_capacity(control: &GroupControl, queue_capacity: usize) -> bool {
-        let queue_capacity = queue_capacity.max(1);
-        let max_control_bytes = MAX_GROUP_CONTROL_QUEUE_BYTES / queue_capacity;
-        size_of::<GroupControl>().saturating_add(control.heap_bytes()) <= max_control_bytes
-    }
-
-    fn try_send(&self, control: GroupControl) -> bool {
-        self.try_send_recover(control).is_ok()
-    }
-
-    fn try_send_recover(&self, control: GroupControl) -> Result<(), GroupControl> {
-        if !self.accepts(&control) {
-            return Err(control);
-        }
-        let payload_bytes = control.heap_bytes();
-        self.tx
-            .try_send(control)
-            .map_err(|error| error.into_inner())?;
-        self.max_payload_bytes
-            .fetch_max(payload_bytes, Ordering::Relaxed);
-        Ok(())
-    }
-}
-
-fn retained_epoch(control: GroupControl) -> Option<GroupRawEpoch> {
-    match control {
-        GroupControl::Transition { epoch, .. } | GroupControl::RawEpoch(epoch) => Some(epoch),
-        GroupControl::Update(_) | GroupControl::Reaction(_) => None,
-    }
-}
-
 struct CallEntry {
     session: CallSession,
-    media_task: Option<AbortHandle>,
-    /// Media counters published by the drive loop, readable through the consumer's `CallHandle`.
-    /// Installed when the engine attaches; absent before that, which reads as all-zero rather than
-    /// as an error, because a call with no media plane genuinely has no media to count.
-    media_stats: Option<Arc<crate::voip::media_stats::MediaStatsCell>>,
+    /// The media plane, behind the neutral seam. It owns the driver command mailboxes (recv-rekey,
+    /// video-control, group-control) and the epoch retained before media attaches; the registry
+    /// reaches media only through [`VoipMediaSession`]. Present from registration, before the
+    /// engine exists, because commands can arrive during setup.
+    media: Option<Arc<dyn VoipMediaSession>>,
+    /// Why this call's media is ending, recorded by the terminal path so the entry's `Drop` can
+    /// hand it to [`VoipMediaSession::close`]. `Local` (a hangup or terminate) by default.
+    close_reason: crate::voip_control::MediaCloseReason,
     /// Keeps a pending call-link admission alive. Cleared on admission and aborted with the entry.
     waiting_room_task: Option<AbortHandle>,
     /// Monotonic token distinguishing this registration from a later same-call-id replacement, so a
     /// finishing task only reaps its OWN entry (the ABA hazard).
     generation: u64,
-    /// Caller-only, one-shot: delivers the answering device LID to the drive loop so it can rekey
-    /// recv. Taken on first use (a duplicate `<accept>` finds `None`); dropped with the entry.
-    rekey_tx: Option<async_channel::Sender<crate::voip::driver::PeerAnswer>>,
-    /// The call's consumer-facing event queue (same channel `CallHandle::events()` reads), so the
-    /// SIGNALING handler can surface `<video state>` changes next to the engine's events.
-    event_tx: Option<CallEventQueue>,
-    /// Mid-call video-plane control into the drive loop (enable/disable/orientation).
-    video_ctl_tx: Option<VideoControlSender>,
-    /// Lossless group roster/key transitions into the media driver.
-    group_ctl_tx: Option<GroupControlQueue>,
     /// WARP authentication-tag width baked into the attached media pipelines. A relay refresh
     /// cannot change this packet boundary without rebuilding every sender and receiver atomically.
     group_warp_mi_tag_len: Option<usize>,
-    /// An epoch may arrive after call-scoped accept but before relay media attaches. Replacing or
-    /// dropping this command erases its key bytes through [`GroupRawEpoch`]'s `Drop`.
-    pending_group_epoch: Option<GroupRawEpoch>,
     /// Fully release the local video endpoints. Stored here so refusal and terminal paths share the
     /// same teardown without keeping codec resources alive through lingering handles.
     video_teardown: Option<Box<dyn Fn() + Send + Sync>>,
@@ -371,6 +271,20 @@ fn upsert_peer_orientation(orientations: &mut Vec<PeerOrientation>, announced: P
 }
 
 impl CallEntry {
+    /// Test-only: the concrete resident session behind the seam, for tests that drive its concrete
+    /// wiring. Production never downcasts.
+    #[cfg(any(test, feature = "test-util"))]
+    fn resident_test(
+        &self,
+    ) -> Option<&crate::voip_control::resident_session::ResidentMediaSession> {
+        self.media
+            .as_ref()
+            .and_then(|media| media.as_any())
+            .and_then(|any| {
+                any.downcast_ref::<crate::voip_control::resident_session::ResidentMediaSession>()
+            })
+    }
+
     /// Install a replacement session, carrying over the facts an entry holds
     /// outside it. A re-offer, a glare resolution and a group promotion all
     /// rebuild the session, and the peer's rotation is stated on the offer and
@@ -493,30 +407,11 @@ impl CallEntry {
         use crate::stats::HeapSize;
 
         let queued_bytes = self
-            .rekey_tx
+            .media
             .as_ref()
-            .map_or(0, |tx| tx.len().saturating_mul(size_of::<String>()))
-            .saturating_add(
-                self.event_tx
-                    .as_ref()
-                    .map_or(0, CallEventQueue::retained_bytes),
-            )
-            .saturating_add(
-                self.video_ctl_tx
-                    .as_ref()
-                    .map_or(0, VideoControlSender::retained_bytes),
-            )
-            .saturating_add(
-                self.group_ctl_tx
-                    .as_ref()
-                    .map_or(0, GroupControlQueue::retained_bytes),
-            );
+            .map_or(0, |media| media.retained_bytes());
         self.session.heap_bytes()
             + self.group.as_ref().map_or(0, HeapSize::heap_bytes)
-            + self
-                .pending_group_epoch
-                .as_ref()
-                .map_or(0, GroupRawEpoch::heap_bytes)
             + self
                 .group_invite_self_device
                 .as_ref()
@@ -531,13 +426,6 @@ impl CallEntry {
                 .iter()
                 .map(|entry| entry.announcer.heap_bytes())
                 .sum::<usize>()
-            + self
-                .media_stats
-                .as_ref()
-                // Fixed-size and behind one Arc: the counters are all integers, so the allocation
-                // is the whole cost. Counted anyway -- a per-call allocation that no report
-                // mentions is how an estimate drifts from the heap it claims to describe.
-                .map_or(0, |_| size_of::<crate::voip::media_stats::MediaStatsCell>())
             + self
                 .peer_announced_capability
                 .capacity()
@@ -569,13 +457,32 @@ impl CallEntry {
 /// requirement before publishing, so a request the consumer never sees is never
 /// made again while every delta keeps being dropped. A displaced one goes back,
 /// shedding the next entry instead -- the same shape as
-/// `CallRegistry::force_send_preserving_epoch`.
+/// `GroupControlQueue::force_send_preserving_epoch`, which the media session owns now.
 ///
 /// `false` when the queue is closed, and when `event` did not survive the
 /// request going back: a single-slot queue has no next entry to shed instead,
 /// so the restore displaces the event just inserted. The request is the one
 /// whose loss is permanent, so it is what stays, and the caller is told its own
 /// event never reached the consumer rather than being left to assume it did.
+/// Publish one event with the per-event byte budget, then force-send it.
+///
+/// A single event larger than `MAX_CALL_EVENT_QUEUE_BYTES / capacity` is refused rather than
+/// displacing the whole bounded queue; everything else is force-sent, dropping the oldest entry
+/// when full. This is the same policy the registry applied through its event queue, kept beside the
+/// session that now owns the stream.
+pub(crate) fn publish_call_event(tx: &async_channel::Sender<CallEvent>, event: CallEvent) -> bool {
+    let payload_bytes = event.heap_bytes();
+    let queue_capacity = tx
+        .capacity()
+        .unwrap_or(DEFAULT_CALL_EVENT_QUEUE_CAPACITY)
+        .max(1);
+    let max_event_bytes = MAX_CALL_EVENT_QUEUE_BYTES / queue_capacity;
+    if size_of::<CallEvent>().saturating_add(payload_bytes) > max_event_bytes {
+        return false;
+    }
+    force_send_call_event(tx, event)
+}
+
 pub(crate) fn force_send_call_event(
     tx: &async_channel::Sender<CallEvent>,
     event: CallEvent,
@@ -592,7 +499,7 @@ pub(crate) fn force_send_call_event(
 
 /// Exclusive publication right for an actionable signaling event awaiting its typed ack.
 pub struct CallEventPermit {
-    tx: CallEventQueue,
+    media: Arc<dyn VoipMediaSession>,
     reserved: Arc<AtomicBool>,
     generation: u64,
 }
@@ -604,7 +511,7 @@ impl CallEventPermit {
 
     pub fn send(&self, event: CallEvent) -> bool {
         // The latest committed state must remain observable even when its consumer is behind.
-        self.tx.force_send(event)
+        self.media.publish(event)
     }
 }
 
@@ -619,6 +526,16 @@ impl Drop for CallEntry {
         self.group_update_event.notify(usize::MAX);
         if let Some(teardown) = self.video_teardown.take() {
             teardown();
+        }
+        // Real close, through the neutral seam: every backend ends its own media here, including
+        // aborting the drive task it owns. The reason is whatever the terminal path recorded,
+        // `Local` (a hangup/terminate) by default.
+        if let Some(media) = self.media.take() {
+            let reason = std::mem::replace(
+                &mut self.close_reason,
+                crate::voip_control::MediaCloseReason::Local,
+            );
+            media.close(reason);
         }
     }
 }
@@ -673,10 +590,17 @@ fn pending_initial_group_control_matches(
 }
 
 /// Thread-safe map of active calls keyed by call-id.
-#[derive(Default)]
 pub struct CallRegistry {
     inner: Mutex<HashMap<String, CallEntry>>,
     next_gen: AtomicU64,
+    /// The media backend every new call's session comes from. The registry never names a concrete
+    /// implementation: it asks the injected backend to `reserve` one per registration, so a build
+    /// that ships no engine (or a test that ships a fake) is substituted at construction.
+    ///
+    /// Settable at most once, from the client builder: calls can only be registered after a client
+    /// exists, so the install always wins. Until then the in-process resident backend answers, which
+    /// is what registry-only tests and `Default` get.
+    backend: std::sync::OnceLock<Arc<dyn VoipMediaBackend>>,
     /// Creator-authenticated controls that overtook their initial group offer. A bounded value
     /// queue avoids retaining one task per fabricated call id while preserving the real offer race.
     pending_initial_group_controls: Mutex<VecDeque<PendingInitialGroupControl>>,
@@ -689,9 +613,54 @@ pub struct CallRegistry {
     ringing: Mutex<HashSet<String>>,
 }
 
+impl Default for CallRegistry {
+    fn default() -> Self {
+        Self {
+            inner: Mutex::new(HashMap::new()),
+            next_gen: AtomicU64::new(0),
+            backend: std::sync::OnceLock::new(),
+            pending_initial_group_controls: Mutex::new(VecDeque::new()),
+            registration_event: Arc::new(event_listener::Event::new()),
+            ringing: Mutex::new(HashSet::new()),
+        }
+    }
+}
+
 impl CallRegistry {
+    /// A registry with the in-process resident backend.
+    ///
+    /// Kept so every existing construction site (registry unit tests, and any caller that only
+    /// needs a registry) compiles unchanged; a client injects its own backend through
+    /// [`with_backend`](Self::with_backend).
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A registry whose calls get their media session from `backend`.
+    ///
+    /// This is the one place the choice of media implementation enters the control plane. The
+    /// registry stores the trait object and asks it to `reserve`; it never names `ResidentMediaSession`
+    /// or any other engine type.
+    pub fn with_backend(backend: Arc<dyn VoipMediaBackend>) -> Self {
+        let registry = Self::default();
+        let _ = registry.backend.set(backend);
+        registry
+    }
+
+    /// Install the media backend, at most once. Called during client assembly.
+    ///
+    /// Returns `false` if a backend was already installed, which is a programming error rather than
+    /// a runtime condition: nothing installs twice.
+    pub fn install_backend(&self, backend: Arc<dyn VoipMediaBackend>) -> bool {
+        self.backend.set(backend).is_ok()
+    }
+
+    /// The media backend this registry reserves sessions from.
+    #[must_use]
+    pub fn backend(&self) -> Arc<dyn VoipMediaBackend> {
+        self.backend
+            .get_or_init(|| Arc::new(NoMediaBackend))
+            .clone()
     }
 
     /// The active-call map, recovering the guard from a poisoned mutex instead of panicking.
@@ -936,13 +905,12 @@ impl CallRegistry {
         self.registration_event.listen()
     }
 
-    /// Deliver a signaling event through the call's consumer queue.
+    /// Deliver a signaling event through the call's session-owned public stream.
     pub fn send_call_event(&self, call_id: &str, event: CallEvent) -> bool {
-        let tx = self
-            .active_calls()
+        self.active_calls()
             .get(call_id)
-            .and_then(|entry| entry.event_tx.clone());
-        tx.is_some_and(|tx| tx.force_send(event))
+            .and_then(|entry| entry.media.clone())
+            .is_some_and(|media| media.publish(event))
     }
 
     /// Deliver an event only while `generation` still owns this call-id.
@@ -952,12 +920,11 @@ impl CallRegistry {
         generation: u64,
         event: CallEvent,
     ) -> bool {
-        let tx = self
-            .active_calls()
+        self.active_calls()
             .get(call_id)
             .filter(|entry| entry.generation == generation)
-            .and_then(|entry| entry.event_tx.clone());
-        tx.is_some_and(|tx| tx.force_send(event))
+            .and_then(|entry| entry.media.clone())
+            .is_some_and(|media| media.publish(event))
     }
 
     /// Atomically apply a newer authoritative group snapshot to an active call.
@@ -979,7 +946,7 @@ impl CallRegistry {
         update: GroupCallUpdate,
         generation: Option<u64>,
     ) -> GroupStateApply {
-        if super::engine::validate_group_relay_update(&update).is_err() {
+        if crate::voip_control::group::validate_group_relay_update(&update).is_err() {
             return GroupStateApply::InvalidSnapshot;
         }
         // Held so the commit lookup survives `update` being moved into the preview.
@@ -1042,21 +1009,14 @@ impl CallRegistry {
                         return GroupStateApply::InvalidSnapshot;
                     }
                 }
-                let control = GroupControl::Update(Box::new(
-                    preview
-                        .snapshot()
-                        .expect("an applied preview owns a snapshot")
-                        .clone(),
-                ));
-                let fits = entry.group_ctl_tx.as_ref().map_or(
-                    !entry.is_call_link || {
-                        GroupControlQueue::accepts_with_capacity(
-                            &control,
-                            DEFAULT_CALL_EVENT_QUEUE_CAPACITY,
-                        )
-                    },
-                    |group_ctl_tx| group_ctl_tx.accepts(&control),
-                );
+                let committed = preview
+                    .snapshot()
+                    .expect("an applied preview owns a snapshot")
+                    .clone();
+                let fits = entry
+                    .media
+                    .as_ref()
+                    .is_some_and(|media| media.group_update_fits(&committed, entry.is_call_link));
                 if !fits {
                     // Do not consume the authoritative transaction when its committed form cannot
                     // fit one production media-driver slot, including before the sender attaches.
@@ -1114,9 +1074,9 @@ impl CallRegistry {
                         entry.peer_orientation_control(&announced.announcer, announced.orientation)
                     })
                     .collect();
-                if let Some(tx) = entry.video_ctl_tx.as_ref() {
+                if let Some(media) = entry.media.as_ref() {
                     for control in reassert {
-                        tx.send(control);
+                        media.submit(video_control_to_command(control));
                     }
                 }
             }
@@ -1325,6 +1285,32 @@ impl CallRegistry {
             .and_then(|entry| entry.group.clone())
     }
 
+    /// The committed roster and the WARP tag width already established for a call, so a backend's
+    /// `open` can replay them into the group mailbox it installs. `None` when the call is gone.
+    #[must_use]
+    pub fn group_attach_replay(
+        &self,
+        call_id: &str,
+        generation: u64,
+    ) -> Option<(Option<GroupCallUpdate>, Option<usize>)> {
+        let map = self.active_calls();
+        let entry = map
+            .get(call_id)
+            .filter(|entry| entry.generation == generation)?;
+        let committed = entry
+            .group
+            .as_ref()
+            .and_then(GroupCallState::snapshot)
+            .cloned();
+        let established = entry
+            .group
+            .as_ref()
+            .and_then(GroupCallState::snapshot)
+            .and_then(|snapshot| snapshot.relay.as_ref())
+            .map(|relay| relay.warp_mi_tag_len.unwrap_or(4) as usize);
+        Some((committed, established))
+    }
+
     /// Whether one exact active group generation carries the supplied signaling creator.
     pub fn group_creator_matches_if_current(
         &self,
@@ -1503,7 +1489,7 @@ impl CallRegistry {
         is_call_link: bool,
     ) -> Result<u64, GroupStateApply> {
         if let Some(initial_update) = session.group.as_ref() {
-            if super::engine::validate_group_relay_update(initial_update).is_err() {
+            if crate::voip_control::group::validate_group_relay_update(initial_update).is_err() {
                 return Err(GroupStateApply::InvalidSnapshot);
             }
             let mut initial_state =
@@ -1547,7 +1533,7 @@ impl CallRegistry {
         let Some(initial_update) = session.group.as_ref() else {
             return Err(GroupStateApply::InvalidSnapshot);
         };
-        if super::engine::validate_group_relay_update(initial_update).is_err() {
+        if crate::voip_control::group::validate_group_relay_update(initial_update).is_err() {
             return Err(GroupStateApply::InvalidSnapshot);
         }
         let mut initial_state =
@@ -1627,7 +1613,7 @@ impl CallRegistry {
                         )
                     });
                 let generation = self.next_gen.fetch_add(1, Ordering::Relaxed);
-                let entry = Self::new_entry(session, generation, true, false);
+                let entry = Self::new_entry(&self.backend(), session, generation, true, false);
                 if ringing_group_entries >= MAX_RINGING_GROUP_CALLS
                     || ringing_group_bytes.saturating_add(entry.retained_bytes(&call_id))
                         > MAX_RINGING_GROUP_CALL_BYTES
@@ -1661,7 +1647,13 @@ impl CallRegistry {
             let mut map = self.active_calls();
             map.insert(
                 session.call_id.clone(),
-                Self::new_entry(session, generation, force_group, is_call_link),
+                Self::new_entry(
+                    &self.backend(),
+                    session,
+                    generation,
+                    force_group,
+                    is_call_link,
+                ),
             )
         };
         // The superseded entry drops here, OUTSIDE the lock: its media-task AbortHandle aborts and its
@@ -1709,11 +1701,23 @@ impl CallRegistry {
     }
 
     fn new_entry(
+        backend: &Arc<dyn VoipMediaBackend>,
         session: CallSession,
         generation: u64,
         force_group: bool,
         is_call_link: bool,
     ) -> CallEntry {
+        // `CallSession.direction` is the neutral `CallDirection` already, so it moves straight
+        // through to the backend with no translation.
+        let direction = session.direction;
+        // Reserved through the injected backend, so the registry never names a concrete media
+        // implementation. The key carries the generation from the first step, so a command from a
+        // superseded generation can never reach this session.
+        let key = MediaSessionKey {
+            call_id: session.call_id.clone(),
+            generation,
+        };
+        let media = backend.reserve(&key, direction);
         let video = VideoNegotiation::new(session.is_video);
         let is_group_call = force_group || session.group.is_some();
         let group = session.group.as_ref().map(|update| {
@@ -1732,16 +1736,11 @@ impl CallRegistry {
             peer_video_orientations: Vec::new(),
             peer_orientation_seq: 0,
             session,
-            media_task: None,
-            media_stats: None,
+            media: Some(media),
+            close_reason: crate::voip_control::MediaCloseReason::Local,
             waiting_room_task: None,
             generation,
-            rekey_tx: None,
-            event_tx: None,
-            video_ctl_tx: None,
-            group_ctl_tx: None,
             group_warp_mi_tag_len: None,
-            pending_group_epoch: None,
             video_teardown: None,
             event_publication_reserved: Arc::new(AtomicBool::new(false)),
             video_transition_lock: Arc::new(AsyncMutex::new(())),
@@ -1828,45 +1827,109 @@ impl CallRegistry {
         true
     }
 
-    /// Install the cell the drive loop publishes media counters into.
+    /// Media counters for one call generation, read through the neutral seam.
+    ///
+    /// A backend that owns a foreign engine reports its own [`MediaStats`](crate::voip_control::MediaStats)
+    /// here; the resident session reports the same counters its drive loop publishes. All-zero is
+    /// the honest answer before media attaches, not an error.
+    pub fn media_stats(&self, call_id: &str, generation: u64) -> crate::voip_control::MediaStats {
+        self.active_calls()
+            .get(call_id)
+            .filter(|entry| entry.generation == generation)
+            .and_then(|entry| entry.media.as_ref())
+            .map(|media| media.stats())
+            .unwrap_or_default()
+    }
+
+    /// Test-only: the concrete resident session for a generation, so a unit test can drive its
+    /// concrete wiring. Production never downcasts; a foreign backend yields `None`.
+    #[cfg(any(test, feature = "test-util"))]
+    #[must_use]
+    pub fn resident_session(
+        &self,
+        call_id: &str,
+        generation: u64,
+    ) -> Option<Arc<crate::voip_control::resident_session::ResidentMediaSession>> {
+        let media = self
+            .active_calls()
+            .get(call_id)
+            .filter(|entry| entry.generation == generation)
+            .and_then(|entry| entry.media.clone())?;
+        let resident = media.as_any().and_then(|any| {
+            any.downcast_ref::<crate::voip_control::resident_session::ResidentMediaSession>()
+        })?;
+        resident.resident_arc()
+    }
+
+    /// The peer rotations retained for a call, resolved to the neutral `(participant, orientation)`
+    /// shape an opener submits. `participant` is `None` for a 1:1 call and the roster's name for a
+    /// group sender.
+    #[must_use]
+    pub fn peer_video_orientations(
+        &self,
+        call_id: &str,
+        generation: u64,
+    ) -> Option<Vec<(Option<Jid>, u8)>> {
+        let map = self.active_calls();
+        let entry = map
+            .get(call_id)
+            .filter(|entry| entry.generation == generation)?;
+        Some(
+            entry
+                .peer_video_orientations
+                .iter()
+                .map(|announced| {
+                    match entry
+                        .peer_orientation_control(&announced.announcer, announced.orientation)
+                    {
+                        VideoControl::SetOrientation(orientation) => (None, orientation),
+                        VideoControl::SetParticipantOrientation {
+                            participant,
+                            orientation,
+                        } => (Some(participant), orientation),
+                        _ => (None, announced.orientation),
+                    }
+                })
+                .collect(),
+        )
+    }
+
+    /// Test-only: install the drive task's abort handle on the resident session of a generation.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn set_media_task(&self, call_id: &str, generation: u64, handle: AbortHandle) {
+        let resident = self.resident_session(call_id, generation);
+        match resident {
+            Some(session) => session.install_media_task(handle),
+            // No matching generation: abort the task immediately, as the old path did.
+            None => drop(handle),
+        }
+    }
+
+    /// Test-only: install the shared counters cell on the resident session of a generation.
+    #[cfg(any(test, feature = "test-util"))]
     pub fn set_media_stats(
         &self,
         call_id: &str,
         generation: u64,
-        cell: Arc<crate::voip::media_stats::MediaStatsCell>,
+        cell: Arc<crate::voip_control::media_stats::MediaStatsCell>,
     ) {
-        if let Some(entry) = self
-            .active_calls()
-            .get_mut(call_id)
-            .filter(|entry| entry.generation == generation)
-        {
-            entry.media_stats = Some(cell);
+        if let Some(session) = self.resident_session(call_id, generation) {
+            session.install_stats_cell(cell);
         }
     }
 
-    /// Media counters for one call generation, or all-zero before the engine attaches.
-    pub fn media_stats(&self, call_id: &str, generation: u64) -> crate::voip::CallMediaStats {
+    /// The media session for one call generation, so a consumer can hold it and read live counters
+    /// through [`VoipMediaSession::stats`] even after the registry entry is gone.
+    #[must_use]
+    pub fn media_session(
+        &self,
+        call_id: &str,
+        generation: u64,
+    ) -> Option<Arc<dyn VoipMediaSession>> {
         self.active_calls()
             .get(call_id)
             .filter(|entry| entry.generation == generation)
-            .and_then(|entry| entry.media_stats.as_ref())
-            .map(|cell| cell.snapshot())
-            .unwrap_or_default()
-    }
-
-    /// Attach (or replace) the media task for the call registered under `generation`. If the call
-    /// was removed or superseded by a newer generation, the handle is aborted immediately so its
-    /// task can't outlive the call.
-    pub fn set_media_task(&self, call_id: &str, generation: u64, handle: AbortHandle) {
-        let aborted = {
-            let mut map = self.active_calls();
-            match map.get_mut(call_id) {
-                Some(entry) if entry.generation == generation => entry.media_task.replace(handle),
-                _ => Some(handle),
-            }
-        };
-        // Both exits abort off-lock, for the reason spelled out at `insert_inner`.
-        drop(aborted);
+            .and_then(|entry| entry.media.clone())
     }
 
     /// Attach the repeating waiting-room heartbeat to one call generation.
@@ -2057,26 +2120,11 @@ impl CallRegistry {
         }
     }
 
-    /// Store the per-call recv-rekey sender (the drive loop holds the matching receiver). Generation-
-    /// guarded and ignored if the call was removed or superseded, so a stale sender can't outlive its
-    /// call. Caller side only.
-    pub fn set_rekey_sender(
-        &self,
-        call_id: &str,
-        generation: u64,
-        tx: async_channel::Sender<crate::voip::driver::PeerAnswer>,
-    ) {
-        if let Some(entry) = self.active_calls().get_mut(call_id)
-            && entry.generation == generation
-        {
-            entry.rekey_tx = Some(tx);
-        }
-    }
-
     /// Store the call's consumer-facing event sender, video-control sender, and the local-video
     /// teardown hook, so the signaling handler can surface `<video state>` changes, steer the video
     /// plane mid-call, and fully release the endpoints on a refused upgrade. Generation-guarded like
     /// the rekey sender.
+    #[cfg(any(test, feature = "test-util"))]
     pub fn set_video_channels(
         &self,
         call_id: &str,
@@ -2088,17 +2136,30 @@ impl CallRegistry {
         if let Some(entry) = self.active_calls().get_mut(call_id)
             && entry.generation == generation
         {
-            entry.event_tx = Some(CallEventQueue::new(event_tx));
+            // The caller created the stream so its `CallHandle` holds the receiver; the session
+            // adopts the sender and becomes the one publisher.
+            if let Some(resident) = entry.resident_test() {
+                resident.install_event_sender(event_tx);
+            }
             // Before the sender is published, so the rotation the offer
             // announced is the first thing the drive loop reads rather than
             // racing the first inbound frame.
-            for announced in entry.peer_video_orientations.clone() {
-                video_ctl_tx.send(
-                    entry.peer_orientation_control(&announced.announcer, announced.orientation),
-                );
-            }
-            entry.video_ctl_tx = Some(video_ctl_tx);
+            let replayed: Vec<VideoControl> = entry
+                .peer_video_orientations
+                .clone()
+                .into_iter()
+                .map(|announced| {
+                    entry.peer_orientation_control(&announced.announcer, announced.orientation)
+                })
+                .collect();
             entry.video_teardown = Some(video_teardown);
+            let Some(resident) = entry.resident_test() else {
+                return;
+            };
+            resident.install_video_sender(video_ctl_tx);
+            for control in replayed {
+                resident.submit(video_control_to_command(control));
+            }
         }
     }
 
@@ -2151,11 +2212,14 @@ impl CallRegistry {
         // two that later reconciliation would merge in whatever order they were
         // pushed -- letting the stale alias overwrite the newest rotation.
         entry.retain_peer_orientation(peer.clone(), orientation);
-        entry.video_ctl_tx.as_ref().map(|tx| tx.send(control));
+        if let Some(media) = entry.media.as_ref() {
+            media.submit(video_control_to_command(control));
+        }
         true
     }
 
     /// Attach the group-media control sender for this call generation.
+    #[cfg(any(test, feature = "test-util"))]
     pub fn set_group_control_sender(
         &self,
         call_id: &str,
@@ -2172,79 +2236,25 @@ impl CallRegistry {
         else {
             return false;
         };
-        if let (Some(established), Some(relay)) = (
-            warp_mi_tag_len,
-            entry
-                .group
-                .as_ref()
-                .and_then(GroupCallState::snapshot)
-                .and_then(|snapshot| snapshot.relay.as_ref()),
-        ) && relay.warp_mi_tag_len.unwrap_or(4) as usize != established
-        {
-            return false;
-        }
-        let tx = GroupControlQueue::new(tx);
-        let update = entry
+        let committed = entry
             .group
             .as_ref()
             .and_then(GroupCallState::snapshot)
             .cloned();
-        let pending_epoch = entry.pending_group_epoch.take();
-        let mut unqueued_epoch = None;
-        let queued = match (update, pending_epoch) {
-            (Some(update), Some(epoch)) => {
-                let transition = GroupControl::Transition {
-                    update: Box::new(update),
-                    epoch,
-                };
-                if tx.accepts(&transition) {
-                    match tx.try_send_recover(transition) {
-                        Ok(()) => true,
-                        Err(control) => {
-                            unqueued_epoch = retained_epoch(control);
-                            false
-                        }
-                    }
-                } else {
-                    // The engine was initialized from the retained roster before this sender is
-                    // attached. If adding the epoch tips their indivisible replay over one slot's
-                    // byte budget, replay the same roster and epoch in order instead.
-                    match transition {
-                        GroupControl::Transition { update, epoch } => {
-                            if !tx.try_send(GroupControl::Update(update)) {
-                                unqueued_epoch = Some(epoch);
-                                false
-                            } else {
-                                match tx.try_send_recover(GroupControl::RawEpoch(epoch)) {
-                                    Ok(()) => true,
-                                    Err(control) => {
-                                        unqueued_epoch = retained_epoch(control);
-                                        false
-                                    }
-                                }
-                            }
-                        }
-                        GroupControl::Update(_)
-                        | GroupControl::RawEpoch(_)
-                        | GroupControl::Reaction(_) => false,
-                    }
-                }
-            }
-            (Some(update), None) => tx.try_send(GroupControl::Update(Box::new(update))),
-            (None, Some(epoch)) => match tx.try_send_recover(GroupControl::RawEpoch(epoch)) {
-                Ok(()) => true,
-                Err(control) => {
-                    unqueued_epoch = retained_epoch(control);
-                    false
-                }
-            },
-            (None, None) => true,
+        // The established width is what the call's own roster recorded; a refresh that would move
+        // the packet boundary under an attached pipeline is refused inside the session.
+        let established = entry
+            .group
+            .as_ref()
+            .and_then(GroupCallState::snapshot)
+            .and_then(|snapshot| snapshot.relay.as_ref())
+            .map(|relay| relay.warp_mi_tag_len.unwrap_or(4) as usize);
+        let Some(resident) = entry.resident_test() else {
+            return false;
         };
-        if !queued {
-            entry.pending_group_epoch = unqueued_epoch;
+        if !resident.install_group_sender(tx, warp_mi_tag_len, committed, established) {
             return false;
         }
-        entry.group_ctl_tx = Some(tx);
         entry.group_warp_mi_tag_len = warp_mi_tag_len;
         true
     }
@@ -2258,30 +2268,27 @@ impl CallRegistry {
         generation: u64,
         update: GroupCallUpdate,
     ) -> bool {
-        let delivery = {
-            let map = self.active_calls();
-            let Some(entry) = map
-                .get(call_id)
-                .filter(|entry| entry.generation == generation)
-            else {
-                return false;
-            };
-            let Some(tx) = entry.group_ctl_tx.clone() else {
-                return true;
-            };
-            // `apply_group_update_if_current` may have inherited relay material omitted by this
-            // wire update. Route that committed snapshot so mailbox coalescing cannot replace a
-            // relay refresh with a later roster-only payload that drops it.
-            let update = entry
-                .group
-                .as_ref()
-                .and_then(GroupCallState::snapshot)
-                .filter(|committed| committed.transaction_id >= update.transaction_id)
-                .cloned()
-                .unwrap_or(update);
-            (tx, update)
+        let map = self.active_calls();
+        let Some(entry) = map
+            .get(call_id)
+            .filter(|entry| entry.generation == generation)
+        else {
+            return false;
         };
-        Self::force_send_preserving_epoch(&delivery.0, GroupControl::Update(Box::new(delivery.1)))
+        let Some(media) = entry.media.clone() else {
+            return false;
+        };
+        // `apply_group_update_if_current` may have inherited relay material omitted by this
+        // wire update. Route that committed snapshot so mailbox coalescing cannot replace a
+        // relay refresh with a later roster-only payload that drops it.
+        let update = entry
+            .group
+            .as_ref()
+            .and_then(GroupCallState::snapshot)
+            .filter(|committed| committed.transaction_id >= update.transaction_id)
+            .cloned()
+            .unwrap_or(update);
+        media.deliver_group_update(Box::new(update))
     }
 
     /// Deliver one decrypted shared epoch only while `generation` owns this call-id.
@@ -2292,29 +2299,26 @@ impl CallRegistry {
         transaction_id: u32,
         raw_epoch: Vec<u8>,
     ) -> bool {
-        let epoch = GroupRawEpoch::new(transaction_id, raw_epoch);
-        let delivery = {
-            let mut map = self.active_calls();
-            let Some(entry) = map
-                .get_mut(call_id)
-                .filter(|entry| entry.generation == generation)
-            else {
-                return false;
-            };
-            Self::retain_or_route_group_epoch(entry, epoch)
+        let map = self.active_calls();
+        let Some(entry) = map
+            .get(call_id)
+            .filter(|entry| entry.generation == generation)
+        else {
+            return false;
         };
-        if let Some((tx, update, epoch)) = delivery {
-            let command = match update {
-                Some(update) => GroupControl::Transition {
-                    update: Box::new(update),
-                    epoch,
-                },
-                None => GroupControl::RawEpoch(epoch),
-            };
-            Self::force_send_preserving_epoch(&tx, command)
-        } else {
-            true
-        }
+        let Some(media) = entry.media.clone() else {
+            return false;
+        };
+        let committed = entry
+            .group
+            .as_ref()
+            .and_then(GroupCallState::snapshot)
+            .cloned();
+        media.deliver_group_epoch(
+            transaction_id,
+            crate::voip_control::MediaGroupEpoch::new(raw_epoch),
+            committed,
+        )
     }
 
     /// The retained epoch transaction for one call generation before its media driver attaches.
@@ -2326,97 +2330,20 @@ impl CallRegistry {
         self.active_calls()
             .get(call_id)
             .filter(|entry| entry.generation == generation)
-            .and_then(|entry| entry.pending_group_epoch.as_ref())
-            .map(|epoch| epoch.transaction_id)
-    }
-
-    /// Keep the newest epoch resident when a bounded group-control mailbox sheds older commands.
-    /// Roster updates may be coalesced under backpressure; losing the only pending epoch would leave
-    /// the media engine permanently unable to decrypt the latest generation.
-    fn force_send_preserving_epoch(tx: &GroupControlQueue, mut command: GroupControl) -> bool {
-        if !tx.accepts(&command) {
-            return false;
-        }
-        let latest_update_transaction = match &command {
-            GroupControl::Update(update) | GroupControl::Transition { update, .. } => {
-                Some(update.transaction_id)
-            }
-            GroupControl::RawEpoch(_) | GroupControl::Reaction(_) => None,
-        };
-        loop {
-            let queued_epoch = command.epoch_transaction_id();
-            tx.max_payload_bytes
-                .fetch_max(command.heap_bytes(), Ordering::Relaxed);
-            // Each retry keeps the newer of the queued and evicted epochs. If the rotation reaches
-            // the roster this delivery just inserted, put that roster back once and shed the next
-            // epoch instead. Existing Transition pairs remain indivisible, while an epoch-only full
-            // mailbox still reserves one slot for the newest authoritative snapshot.
-            match tx.tx.force_send(command) {
-                Ok(Some(evicted)) => {
-                    let evicted_latest_update = latest_update_transaction.is_some_and(
-                        |latest_transaction| match &evicted {
-                            GroupControl::Update(update)
-                            | GroupControl::Transition { update, .. } => {
-                                update.transaction_id == latest_transaction
-                            }
-                            GroupControl::RawEpoch(_) | GroupControl::Reaction(_) => false,
-                        },
-                    );
-                    if evicted_latest_update {
-                        tx.max_payload_bytes
-                            .fetch_max(evicted.heap_bytes(), Ordering::Relaxed);
-                        return tx.tx.force_send(evicted).is_ok();
-                    }
-                    if evicted
-                        .epoch_transaction_id()
-                        .is_some_and(|evicted_transaction| {
-                            queued_epoch.is_none_or(|queued| evicted_transaction > queued)
-                        })
-                    {
-                        command = evicted;
-                    } else {
-                        return true;
-                    }
-                }
-                Ok(None) => return true,
-                Err(_) => return false,
-            }
-        }
-    }
-
-    fn retain_or_route_group_epoch(
-        entry: &mut CallEntry,
-        epoch: GroupRawEpoch,
-    ) -> Option<(GroupControlQueue, Option<GroupCallUpdate>, GroupRawEpoch)> {
-        if let Some(tx) = entry.group_ctl_tx.clone() {
-            let update = entry
-                .group
-                .as_ref()
-                .and_then(GroupCallState::snapshot)
-                .cloned();
-            return Some((tx, update, epoch));
-        }
-        let replace = entry
-            .pending_group_epoch
-            .as_ref()
-            .is_none_or(|pending| epoch.transaction_id > pending.transaction_id);
-        if replace {
-            entry.pending_group_epoch = Some(epoch);
-        }
-        None
+            .and_then(|entry| entry.media.as_ref())
+            .and_then(|media| media.pending_group_epoch())
     }
 
     /// Queue one RTC reaction on the active group media stream.
     pub fn send_group_reaction(&self, call_id: &str, emoji: String) -> bool {
-        if crate::voip::app_data::encode_reaction(1, &emoji).is_err() {
+        if crate::voip_control::app_data::encode_reaction(1, &emoji).is_err() {
             return false;
         }
-        let tx = self
-            .active_calls()
+        self.active_calls()
             .get(call_id)
             .filter(|entry| entry.group.is_some())
-            .and_then(|entry| entry.group_ctl_tx.clone());
-        tx.is_some_and(|tx| tx.try_send(GroupControl::Reaction(emoji)))
+            .and_then(|entry| entry.media.clone())
+            .is_some_and(|media| media.submit(MediaCommand::SendGroupReaction(emoji)))
     }
 
     /// Queue one validated reaction only while `generation` owns an active group call.
@@ -2426,15 +2353,14 @@ impl CallRegistry {
         generation: u64,
         emoji: String,
     ) -> bool {
-        if crate::voip::app_data::encode_reaction(1, &emoji).is_err() {
+        if crate::voip_control::app_data::encode_reaction(1, &emoji).is_err() {
             return false;
         }
-        let tx = self
-            .active_calls()
+        self.active_calls()
             .get(call_id)
             .filter(|entry| entry.generation == generation && entry.group.is_some())
-            .and_then(|entry| entry.group_ctl_tx.clone());
-        tx.is_some_and(|tx| tx.try_send(GroupControl::Reaction(emoji)))
+            .and_then(|entry| entry.media.clone())
+            .is_some_and(|media| media.submit(MediaCommand::SendGroupReaction(emoji)))
     }
 
     /// Replace the one-shot endpoint teardown for the current call generation.
@@ -2473,24 +2399,23 @@ impl CallRegistry {
     /// Serialize an actionable signaling event across its typed ack. The permit force-inserts the
     /// committed transition, so queue pressure cannot hide peer-visible state from the consumer.
     pub fn reserve_call_event(&self, call_id: &str) -> Option<CallEventPermit> {
-        let (tx, reserved, generation) = {
+        let (media, reserved, generation) = {
             let map = self.active_calls();
             let entry = map.get(call_id)?;
             (
-                entry.event_tx.clone()?,
+                entry.media.clone()?,
                 entry.event_publication_reserved.clone(),
                 entry.generation,
             )
         };
-        if tx.tx.is_closed()
-            || reserved
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .is_err()
+        if reserved
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
         {
             return None;
         }
         Some(CallEventPermit {
-            tx,
+            media,
             reserved,
             generation,
         })
@@ -2950,13 +2875,13 @@ impl CallRegistry {
 
     /// Send a mid-call video-plane command to the current drive loop.
     pub fn send_video_ctl(&self, call_id: &str, generation: u64, ctl: VideoControl) {
-        let tx = self
+        let media = self
             .active_calls()
             .get(call_id)
             .filter(|entry| entry.generation == generation)
-            .and_then(|e| e.video_ctl_tx.clone());
-        if let Some(tx) = tx {
-            let _ = tx.send(ctl);
+            .and_then(|e| e.media.clone());
+        if let Some(media) = media {
+            media.submit(video_control_to_command(ctl));
         }
     }
 
@@ -3060,8 +2985,8 @@ impl CallRegistry {
         &self,
         call_id: &str,
         peer: crate::stanza::call::CapabilityBit,
-    ) -> Option<crate::voip::audio::AudioCodec> {
-        use crate::voip::audio::AudioCodec;
+    ) -> Option<crate::voip_control::MediaAudioCodec> {
+        use crate::voip_control::MediaAudioCodec as AudioCodec;
 
         let format = self
             .active_calls()
@@ -3071,7 +2996,7 @@ impl CallRegistry {
         // profile carries standard Opus in MLOW's framing, so a peer that cleared the bit cannot
         // parse it either. Keyed on the codec, an escape call would sail past this check and put a
         // rewritten TOC on the wire for a peer that registered native Opus on the same payload type.
-        let local_mlow = format.rtp_profile == crate::voip::audio::AudioRtpProfile::Mlow;
+        let local_mlow = format.rtp_profile == crate::voip_control::MediaAudioRtpProfile::Mlow;
         let effective_mlow = crate::stanza::call::mlow_after_peer_capability(local_mlow, peer);
         (effective_mlow != local_mlow).then_some(if effective_mlow {
             AudioCodec::Mlow
@@ -3086,13 +3011,16 @@ impl CallRegistry {
     /// One-shot: the sender is TAKEN, so a duplicate or late `<accept>` from another device is a
     /// no-op (first answerer wins, matching WA Web). Silently ignored when absent (no engine yet, an
     /// incoming call, or the call is torn down).
-    pub fn send_rekey(&self, call_id: &str, answer: crate::voip::driver::PeerAnswer) {
-        let tx = self
+    pub fn send_rekey(&self, call_id: &str, answer: crate::voip_control::control::PeerAnswer) {
+        let media = self
             .active_calls()
-            .get_mut(call_id)
-            .and_then(|e| e.rekey_tx.take());
-        if let Some(tx) = tx {
-            let _ = tx.try_send(answer);
+            .get(call_id)
+            .and_then(|e| e.media.clone());
+        if let Some(media) = media {
+            media.submit(MediaCommand::RekeyRecv {
+                answering_lid: answer.answering_lid,
+                audio_codec: answer.audio_codec,
+            });
         }
     }
 
@@ -3246,11 +3174,34 @@ impl CallRegistry {
         self.pending_controls().clear();
         let drained: Vec<CallEntry> = {
             let mut map = self.active_calls();
+            // The relay is gone, so every session ends for the same reason. Set before the entries
+            // drop, so `VoipMediaSession::close` receives it instead of the `Local` default.
+            for entry in map.values_mut() {
+                entry.close_reason = crate::voip_control::MediaCloseReason::RelayDisconnected;
+            }
             map.drain().map(|(_, entry)| entry).collect()
         };
         let n = drained.len();
-        // `drained` drops here, off-lock: every entry aborts its media task and fires on_terminal.
+        // `drained` drops here, off-lock: every entry closes its media, aborts its media task and
+        // fires on_terminal.
         n
+    }
+
+    /// Record why a call generation's media is ending, so the entry's `Drop` hands the reason to
+    /// [`VoipMediaSession::close`]. Generation-guarded and ignored for an unknown call.
+    pub fn set_close_reason(
+        &self,
+        call_id: &str,
+        generation: u64,
+        reason: crate::voip_control::MediaCloseReason,
+    ) {
+        if let Some(entry) = self
+            .active_calls()
+            .get_mut(call_id)
+            .filter(|entry| entry.generation == generation)
+        {
+            entry.close_reason = reason;
+        }
     }
 }
 
@@ -3261,7 +3212,8 @@ mod tests {
         CallLinkMedia, GroupCallDevice, GroupCallEncRekey, GroupCallParticipant, GroupCallRelay,
         GroupCallRelayEndpoint, GroupCallUpdate, ScreenShareState, WaitingRoom,
     };
-    use crate::voip::driver::video_control_channel;
+    use crate::voip_control::control::GroupRawEpoch;
+    use crate::voip_control::control::video_control_channel;
     use futures::FutureExt;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -3273,6 +3225,295 @@ mod tests {
             Jid::new("222222222222222", Server::Lid),
             Jid::new("111111111111111", Server::Lid),
         )
+    }
+
+    #[test]
+    fn a_fake_backend_drives_the_whole_vertical_slice_through_the_contract() {
+        use crate::voip_control::fake_backend::FakeMediaBackend;
+        use crate::voip_control::{MediaCommand, MediaGroupEpoch, MediaSessionKey};
+
+        // The architectural gate: reserve through the injected backend, then drive commands, stats,
+        // group roster/epoch and close without the registry ever naming the engine. If this test
+        // needed `ResidentMediaSession`, `as_any` or a downcast, the seam would not be neutral.
+        let backend = Arc::new(FakeMediaBackend::new());
+        let registry = CallRegistry::with_backend(backend.clone());
+
+        let generation = registry.insert(session("FAKE-CALL"));
+        let key = MediaSessionKey {
+            call_id: "FAKE-CALL".to_string(),
+            generation,
+        };
+        let media = backend
+            .session(&key)
+            .expect("the backend reserved a session for this generation");
+
+        // Pre-attach command: the key existed from reservation, so this lands on the right session.
+        assert!(registry.send_group_epoch_if_current("FAKE-CALL", generation, 5, vec![1, 2, 3]));
+
+        // Stats flow through the seam, set by the backend.
+        let stats = wacore::voip_control::MediaStats::builder()
+            .rtp_received(11)
+            .audio_frames_decoded(7)
+            .build();
+        media.set_stats(stats);
+        assert_eq!(
+            registry.media_stats("FAKE-CALL", generation).rtp_received,
+            11
+        );
+        assert_eq!(
+            registry
+                .media_stats("FAKE-CALL", generation)
+                .audio_frames_decoded,
+            7
+        );
+
+        // A roster and a decrypted epoch delivered through the neutral path.
+        assert!(registry.send_group_update_if_current("FAKE-CALL", generation, group_update(1)));
+        assert!(registry.send_group_epoch_if_current("FAKE-CALL", generation, 6, vec![4, 5, 6]));
+
+        // The session publishes a media event on its own subscription, proving the neutral event
+        // stream works end to end without the engine.
+        let events = media.subscribe();
+        assert!(media.publish(crate::voip_control::MediaEvent::RelayAllocated));
+        assert_eq!(
+            events.try_recv(),
+            Ok(crate::voip_control::MediaEvent::RelayAllocated),
+            "a backend event reaches a subscriber"
+        );
+
+        // Close ends this generation's media.
+        registry.remove_if_current("FAKE-CALL", generation);
+
+        let record = media.record();
+        assert!(
+            record
+                .commands
+                .iter()
+                .any(|(c, _)| matches!(c, MediaCommand::ApplyGroupUpdate(_))),
+            "the roster reached the neutral session"
+        );
+        assert!(
+            record
+                .commands
+                .iter()
+                .any(|(c, _)| matches!(c, MediaCommand::ApplyGroupEpoch { .. })),
+            "the decrypted epoch reached the neutral session"
+        );
+        assert_eq!(
+            record.closed,
+            Some(crate::voip_control::MediaCloseReason::Local),
+            "close reached the neutral session"
+        );
+        // The group epoch is erased by `MediaGroupEpoch` on drop; assert we built a neutral one.
+        let _ = MediaGroupEpoch::new(vec![0; 32]);
+    }
+
+    #[tokio::test]
+    async fn a_backend_open_is_a_real_lifecycle_step() {
+        use crate::voip_control::fake_backend::FakeMediaBackend;
+        use crate::voip_control::{MediaSessionKey, MediaSessionSpec, MediaSetupError};
+
+        // `open` is a real operation on the backend: a spec it refuses comes back as its typed
+        // error, and the same call on a permissive backend succeeds. No engine, no registry types.
+        let refusing = FakeMediaBackend::refusing();
+        let accepting = FakeMediaBackend::new();
+        // Built twice rather than cloned: `MediaSessionSpec` is not `Clone`, so a spec is
+        // consumed by exactly one `open`.
+        let spec = || {
+            MediaSessionSpec::builder()
+                .key(MediaSessionKey {
+                    call_id: "OPEN-CALL".to_string(),
+                    generation: 1,
+                })
+                .direction(crate::voip_control::CallDirection::Outgoing)
+                .self_lid("1:0@lid".into())
+                .peer_lid("2:0@lid".into())
+                .call_key(vec![0u8; 32])
+                .ssrc(1)
+                .audio(
+                    crate::voip_control::MediaAudioSpec::builder()
+                        .format(crate::voip_control::MediaAudioFormat::MLOW_16KHZ_60MS)
+                        .io(crate::voip_control::MediaAudioIo::Pcm)
+                        .build(),
+                )
+                .relay_token(vec![])
+                .auth_token(vec![])
+                .relay_ip("127.0.0.1".into())
+                .relay_port(3478)
+                .integrity_key(vec![])
+                .warp_mi_tag_len(4)
+                .enable_media(false)
+                .enable_video(false)
+                .enable_sframe(false)
+                .build()
+        };
+        assert!(matches!(
+            refusing
+                .open(spec(), crate::voip_control::MediaOpenContext::for_test())
+                .await,
+            Err(MediaSetupError::Backend(_))
+        ));
+        assert!(
+            accepting
+                .open(spec(), crate::voip_control::MediaOpenContext::for_test())
+                .await
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_generation_aba_replacement_does_not_cross_sessions() {
+        use crate::voip_control::fake_backend::FakeMediaBackend;
+        use crate::voip_control::{MediaCommand, MediaSessionKey};
+
+        // ABA: call_id X gen 10, then call_id X gen 11. A late command carrying gen 10 must not
+        // reach gen 11's session, and vice versa.
+        let backend = Arc::new(FakeMediaBackend::new());
+        let registry = CallRegistry::with_backend(backend.clone());
+
+        let generation_10 = registry.insert(session("X"));
+        let old = backend
+            .session(&MediaSessionKey {
+                call_id: "X".to_string(),
+                generation: generation_10,
+            })
+            .expect("gen 10 reserved");
+
+        // Re-registering the same call-id supersedes gen 10.
+        let generation_11 = registry.insert(session("X"));
+        assert_ne!(generation_10, generation_11);
+        let new = backend
+            .session(&MediaSessionKey {
+                call_id: "X".to_string(),
+                generation: generation_11,
+            })
+            .expect("gen 11 reserved");
+
+        // A late epoch for gen 10 is refused; the live generation accepts its own.
+        assert!(!registry.send_group_epoch_if_current("X", generation_10, 1, vec![9]));
+        assert!(registry.send_group_epoch_if_current("X", generation_11, 2, vec![8]));
+
+        let old_record = old.record();
+        let new_record = new.record();
+        assert!(
+            !old_record
+                .commands
+                .iter()
+                .any(|(c, _)| matches!(c, MediaCommand::ApplyGroupEpoch { .. })),
+            "a superseded generation must not receive commands"
+        );
+        assert!(
+            new_record
+                .commands
+                .iter()
+                .any(|(c, _)| matches!(c, MediaCommand::ApplyGroupEpoch { .. })),
+            "the live generation receives its own command"
+        );
+    }
+
+    #[test]
+    fn dropping_a_call_closes_its_session_through_the_seam() {
+        use crate::voip_control::fake_backend::FakeMediaBackend;
+        use crate::voip_control::{MediaCloseReason, MediaSessionKey};
+
+        // Gate 6: `close()` really ends the media. The registry never names the backend's session
+        // type; it drops the entry and the session observes the call.
+        let backend = Arc::new(FakeMediaBackend::new());
+        let registry = CallRegistry::with_backend(backend.clone());
+        let generation = registry.insert(session("CLOSE-CALL"));
+        let media = backend
+            .session(&MediaSessionKey {
+                call_id: "CLOSE-CALL".to_string(),
+                generation,
+            })
+            .expect("reserved");
+
+        // A disconnect records the reason before the entries drop.
+        assert_eq!(registry.abort_all(), 1);
+        assert_eq!(
+            media.record().closed,
+            Some(MediaCloseReason::RelayDisconnected)
+        );
+    }
+
+    #[test]
+    fn a_superseded_generation_is_closed_with_the_local_reason() {
+        use crate::voip_control::fake_backend::FakeMediaBackend;
+        use crate::voip_control::{MediaCloseReason, MediaSessionKey};
+
+        let backend = Arc::new(FakeMediaBackend::new());
+        let registry = CallRegistry::with_backend(backend.clone());
+        let first = registry.insert(session("X"));
+        let first_media = backend
+            .session(&MediaSessionKey {
+                call_id: "X".to_string(),
+                generation: first,
+            })
+            .expect("reserved");
+
+        // Replacing the same call-id drops the old entry, which closes its session.
+        let _second = registry.insert(session("X"));
+        assert_eq!(first_media.record().closed, Some(MediaCloseReason::Local));
+    }
+
+    #[test]
+    fn a_recorded_failure_reason_reaches_the_closed_session() {
+        use crate::voip_control::fake_backend::FakeMediaBackend;
+        use crate::voip_control::{MediaCloseReason, MediaSessionKey};
+
+        // A setup or send failure must reach the backend as its own reason, not as the `Local`
+        // default a plain hangup carries, or a foreign backend cannot tell a broken call from an
+        // ended one. `set_close_reason` is the control plane's record; the entry's `Drop` delivers it.
+        let backend = Arc::new(FakeMediaBackend::new());
+        let registry = CallRegistry::with_backend(backend.clone());
+        let generation = registry.insert(session("FAIL-CALL"));
+        let media = backend
+            .session(&MediaSessionKey {
+                call_id: "FAIL-CALL".to_string(),
+                generation,
+            })
+            .expect("reserved");
+
+        registry.set_close_reason(
+            "FAIL-CALL",
+            generation,
+            MediaCloseReason::SendFailed("sctp write failed".to_string()),
+        );
+        assert!(registry.remove_if_current("FAIL-CALL", generation));
+        assert_eq!(
+            media.record().closed,
+            Some(MediaCloseReason::SendFailed(
+                "sctp write failed".to_string()
+            )),
+            "the failure reason reaches close, not Local"
+        );
+    }
+
+    #[test]
+    fn a_stale_generation_close_reason_is_ignored() {
+        use crate::voip_control::fake_backend::FakeMediaBackend;
+        use crate::voip_control::{MediaCloseReason, MediaSessionKey};
+
+        // The reason is generation-guarded: a late failure from a superseded generation must not
+        // relabel the live one's close.
+        let backend = Arc::new(FakeMediaBackend::new());
+        let registry = CallRegistry::with_backend(backend.clone());
+        let old = registry.insert(session("GEN"));
+        let live = registry.insert(session("GEN"));
+        let live_media = backend
+            .session(&MediaSessionKey {
+                call_id: "GEN".to_string(),
+                generation: live,
+            })
+            .expect("reserved");
+
+        registry.set_close_reason(
+            "GEN",
+            old,
+            MediaCloseReason::SendFailed("stale".to_string()),
+        );
+        assert!(registry.remove_if_current("GEN", live));
+        assert_eq!(live_media.record().closed, Some(MediaCloseReason::Local));
     }
 
     fn group_update(transaction_id: u32) -> GroupCallUpdate {
@@ -3996,6 +4237,9 @@ mod tests {
             GroupControl::Transition { update, epoch } => {
                 assert_eq!(update.transaction_id, 2);
                 assert_eq!(epoch.transaction_id, 3);
+                // Raw key bytes exist only with the engine: without `voip` the identity
+                // assertion above is the whole check.
+                #[cfg(feature = "voip")]
                 assert_eq!(
                     epoch.as_bytes(),
                     [3; 32],
@@ -4242,34 +4486,6 @@ mod tests {
     }
 
     #[test]
-    fn call_event_queue_rejects_payloads_that_break_its_total_byte_budget() {
-        let (event_tx, event_rx) = async_channel::bounded(DEFAULT_CALL_EVENT_QUEUE_CAPACITY);
-        let queue = CallEventQueue::new(event_tx);
-        let mut update = group_update(1);
-        update.participants.push(GroupCallParticipant {
-            jid: Jid::new("222222222222222", Server::Lid),
-            pn: None,
-            state: Some("connected".to_string()),
-            participant_type: None,
-            devices: vec![GroupCallDevice {
-                jid: Jid::new("222222222222222", Server::Lid).with_device(1),
-                platform: Some("web".to_string()),
-                pid: Some(2),
-                capability_version: Some(1),
-                capability: vec![7; MAX_CALL_EVENT_QUEUE_BYTES],
-            }],
-        });
-
-        assert!(!queue.force_send(CallEvent::GroupUpdated(Box::new(update))));
-        assert!(event_rx.is_empty());
-        assert_eq!(queue.retained_bytes(), 0);
-        assert!(
-            queue.force_send(CallEvent::RelayAllocated),
-            "rejecting an oversized snapshot must leave capacity for lifecycle events"
-        );
-    }
-
-    #[test]
     fn group_control_queue_rejects_payloads_that_break_its_total_byte_budget() {
         let (control_tx, control_rx) = async_channel::bounded(DEFAULT_CALL_EVENT_QUEUE_CAPACITY);
         let queue = GroupControlQueue::new(control_tx);
@@ -4288,17 +4504,14 @@ mod tests {
             }],
         });
 
-        assert!(!CallRegistry::force_send_preserving_epoch(
-            &queue,
-            GroupControl::Update(Box::new(update)),
-        ));
+        assert!(!queue.force_send_preserving_epoch(GroupControl::Update(Box::new(update)),));
         assert!(control_rx.is_empty());
         assert_eq!(queue.retained_bytes(), 0);
         assert!(
-            CallRegistry::force_send_preserving_epoch(
-                &queue,
-                GroupControl::RawEpoch(GroupRawEpoch::new(1, vec![7; 32])),
-            ),
+            queue.force_send_preserving_epoch(GroupControl::RawEpoch(GroupRawEpoch::new(
+                1,
+                vec![7; 32]
+            ))),
             "rejecting an oversized roster must leave capacity for an epoch"
         );
     }
@@ -4571,26 +4784,18 @@ mod tests {
     fn bounded_group_mailbox_preserves_epoch_across_roster_bursts() {
         let (raw_tx, rx) = async_channel::bounded(2);
         let tx = GroupControlQueue::new(raw_tx);
-        assert!(CallRegistry::force_send_preserving_epoch(
-            &tx,
-            GroupControl::Update(Box::new(group_update(7))),
-        ));
-        assert!(CallRegistry::force_send_preserving_epoch(
-            &tx,
-            GroupControl::Reaction("queued".to_string()),
-        ));
-        assert!(CallRegistry::force_send_preserving_epoch(
-            &tx,
-            GroupControl::Transition {
-                update: Box::new(group_update(7)),
-                epoch: GroupRawEpoch::new(7, vec![7; 32]),
-            },
-        ));
+        assert!(tx.force_send_preserving_epoch(GroupControl::Update(Box::new(group_update(7))),));
+        assert!(tx.force_send_preserving_epoch(GroupControl::Reaction("queued".to_string()),));
+        assert!(tx.force_send_preserving_epoch(GroupControl::Transition {
+            update: Box::new(group_update(7)),
+            epoch: GroupRawEpoch::new(7, vec![7; 32]),
+        },));
         for transaction_id in 8..=9 {
-            assert!(CallRegistry::force_send_preserving_epoch(
-                &tx,
-                GroupControl::Update(Box::new(group_update(transaction_id))),
-            ));
+            assert!(
+                tx.force_send_preserving_epoch(GroupControl::Update(Box::new(group_update(
+                    transaction_id
+                ))),)
+            );
         }
 
         let controls = [rx.try_recv().unwrap(), rx.try_recv().unwrap()];
@@ -4615,19 +4820,15 @@ mod tests {
         let (raw_tx, rx) = async_channel::bounded(2);
         let tx = GroupControlQueue::new(raw_tx);
         for transaction_id in 8..=9 {
-            assert!(CallRegistry::force_send_preserving_epoch(
-                &tx,
-                GroupControl::RawEpoch(GroupRawEpoch::new(
+            assert!(
+                tx.force_send_preserving_epoch(GroupControl::RawEpoch(GroupRawEpoch::new(
                     transaction_id,
                     vec![transaction_id as u8; 32],
-                )),
-            ));
+                )),)
+            );
         }
 
-        assert!(CallRegistry::force_send_preserving_epoch(
-            &tx,
-            GroupControl::Update(Box::new(group_update(10))),
-        ));
+        assert!(tx.force_send_preserving_epoch(GroupControl::Update(Box::new(group_update(10))),));
 
         let controls = [rx.try_recv().unwrap(), rx.try_recv().unwrap()];
         assert!(
@@ -6156,7 +6357,7 @@ mod tests {
         assert!(force_send_call_event(
             &tx,
             CallEvent::GroupControlRejected {
-                control: crate::voip::engine::GroupControlKind::Update,
+                control: crate::voip_control::MediaGroupControlKind::Update,
             }
         ));
         assert!(force_send_call_event(&tx, CallEvent::RelayAllocated));
@@ -6539,13 +6740,6 @@ mod tests {
         );
     }
 
-    fn peer_answer(lid: &str) -> crate::voip::driver::PeerAnswer {
-        crate::voip::driver::PeerAnswer {
-            answering_lid: lid.to_string(),
-            audio_codec: None,
-        }
-    }
-
     /// An abort handle that flips a shared flag, so a test can assert the registry actually aborts
     /// the stored handle (the runtime-agnostic analog of asserting a tokio task was cancelled).
     fn flag_handle(flag: &Arc<AtomicBool>) -> AbortHandle {
@@ -6558,11 +6752,11 @@ mod tests {
     #[test]
     fn a_peer_that_clears_the_mlow_bit_selects_opus_for_a_live_call() {
         use crate::stanza::call::CapabilityBit;
-        use crate::voip::audio::{AudioCodec, AudioFormat};
+        use crate::voip_control::MediaAudioCodec as AudioCodec;
 
         let reg = CallRegistry::new();
         let mut s = session("CID");
-        s.audio_format = Some(AudioFormat::MLOW_16KHZ_60MS);
+        s.audio_format = Some(crate::voip_control::MediaAudioFormat::MLOW_16KHZ_60MS);
         reg.insert(s);
         assert_eq!(
             reg.peer_selected_audio_codec("CID", CapabilityBit::Clear),
@@ -6585,11 +6779,10 @@ mod tests {
     #[test]
     fn a_locally_chosen_opus_call_is_never_pulled_back_to_mlow() {
         use crate::stanza::call::CapabilityBit;
-        use crate::voip::audio::AudioFormat;
 
         let reg = CallRegistry::new();
         let mut s = session("CID");
-        s.audio_format = Some(AudioFormat::OPUS_16KHZ_60MS);
+        s.audio_format = Some(crate::voip_control::MediaAudioFormat::OPUS_16KHZ_60MS);
         reg.insert(s);
         for peer in [
             CapabilityBit::Set,
@@ -6692,26 +6885,27 @@ mod tests {
     }
 
     #[test]
-    fn send_rekey_is_one_shot_and_generation_guarded() {
-        let reg = CallRegistry::new();
-        let g = reg.insert(session("CID"));
-        let (tx, rx) = async_channel::bounded::<crate::voip::driver::PeerAnswer>(1);
-        // A stale generation is ignored (no sender stored).
-        reg.set_rekey_sender("CID", g + 99, tx.clone());
-        reg.send_rekey("CID", peer_answer("x"));
-        assert!(
-            rx.try_recv().is_err(),
-            "stale-generation sender must not fire"
-        );
-        // The live generation stores it; the first send fires, the second is a no-op (taken).
-        reg.set_rekey_sender("CID", g, tx);
-        reg.send_rekey("CID", peer_answer("222222222222222:2@lid"));
+    fn send_rekey_is_one_shot_on_the_session() {
+        use crate::voip_control::resident_session::ResidentMediaSession;
+        let session = ResidentMediaSession::new();
+        let rx = session
+            .take_rekey_receiver()
+            .expect("the session owns a rekey receiver");
+        // The first answer wins and lands on the receiver.
+        assert!(session.submit(MediaCommand::RekeyRecv {
+            answering_lid: "222222222222222:2@lid".into(),
+            audio_codec: None,
+        }));
         assert_eq!(
             rx.try_recv().ok().map(|answer| answer.answering_lid),
             Some("222222222222222:2@lid".to_string())
         );
-        reg.send_rekey("CID", peer_answer("again"));
-        assert!(rx.try_recv().is_err(), "rekey sender is one-shot");
+        // A second rkey overflows the bounded(1) slot with the receiver already consumed; the
+        // command is a no-op at the drive loop, matching first-answerer-wins.
+        let _ = session.submit(MediaCommand::RekeyRecv {
+            answering_lid: "333333333333333:3@lid".into(),
+            audio_codec: None,
+        });
     }
 
     #[test]

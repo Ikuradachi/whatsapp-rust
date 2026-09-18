@@ -9,7 +9,8 @@ use std::collections::{HashMap, HashSet};
 use wacore_binary::Jid;
 
 use crate::types::group_call::{
-    GROUP_CALL_MAX_PARTICIPANTS, GroupCallUpdate, ScreenShare, ScreenShareState, WaitingRoom,
+    GROUP_CALL_MAX_PARTICIPANTS, GroupCallDevice, GroupCallParticipant, GroupCallUpdate,
+    ScreenShare, ScreenShareState, WaitingRoom,
 };
 
 /// Result of applying an authoritative group or waiting-room update.
@@ -266,14 +267,127 @@ fn valid_group_snapshot(update: &GroupCallUpdate) -> bool {
                     && devices.insert(device.jid.clone())
                     && device.pid.is_none_or(|pid| pid != 0 && pids.insert(pid))
             })
-    }) && super::group_media::validate_group_media_snapshot(update).is_ok()
+    }) && validate_group_snapshot_for_media(update).is_ok()
+}
+
+/// Reject a roster whose connected devices collide on a participant identity or an SSRC.
+///
+/// The media engine depends on this before it routes a packet: a duplicate SSRC would let one
+/// participant's media land in another's decoder. The check is pure (HKDF over the call-id and
+/// participant id via the neutral `ssrc` module), so it belongs to the control plane and runs the
+/// same whether or not the engine is compiled.
+pub(crate) fn validate_group_snapshot_for_media(update: &GroupCallUpdate) -> Result<(), ()> {
+    use crate::voip_control::ssrc::{
+        APP_DATA_SSRC_SLOT_WORD, VIDEO_SSRC_SLOT_WORD, derive_wasm_participant_ssrc,
+        format_e2e_srtp_participant_id,
+    };
+
+    const RELAY_STREAM_SLOT_COUNT: u32 = 9;
+    let mut pids = HashSet::new();
+    let mut devices = HashSet::new();
+    let mut audio = HashSet::new();
+    let mut video = HashSet::new();
+    let mut app_data = HashSet::new();
+    let mut rtcp = HashSet::new();
+    for device in update
+        .participants
+        .iter()
+        .filter(|participant| participant.state.as_deref() == Some("connected"))
+        .flat_map(|participant| &participant.devices)
+    {
+        let Some(pid) = device.pid else {
+            continue;
+        };
+        let participant_id = format_e2e_srtp_participant_id(&device.jid.to_string());
+        if pid == 0 || !pids.insert(pid) || !devices.insert(participant_id.clone()) {
+            return Err(());
+        }
+        let audio_ssrc = derive_wasm_participant_ssrc(&update.call_id, &participant_id, 0);
+        let video_ssrc =
+            derive_wasm_participant_ssrc(&update.call_id, &participant_id, VIDEO_SSRC_SLOT_WORD);
+        let app_data_ssrc =
+            derive_wasm_participant_ssrc(&update.call_id, &participant_id, APP_DATA_SSRC_SLOT_WORD);
+        if !audio.insert(audio_ssrc) || !video.insert(video_ssrc) || !app_data.insert(app_data_ssrc)
+        {
+            return Err(());
+        }
+        for slot_word in 0..RELAY_STREAM_SLOT_COUNT {
+            let rtcp_ssrc =
+                derive_wasm_participant_ssrc(&update.call_id, &participant_id, slot_word);
+            if !rtcp.insert(rtcp_ssrc) {
+                return Err(());
+            }
+        }
+    }
+    Ok(())
+}
+
+///
+/// Matches on the user (LID or its PN alias) and the device id together: the same device id on a
+/// different account is a different device, and a PN alias of the local account is still local.
+pub(crate) fn group_device_is_local(
+    participant: &GroupCallParticipant,
+    device: &GroupCallDevice,
+    local_device: &Jid,
+) -> bool {
+    use wacore_binary::JidExt;
+
+    let owns_local_user = participant.jid.is_same_user_as(local_device)
+        || participant
+            .pn
+            .as_ref()
+            .is_some_and(|pn| pn.is_same_user_as(local_device));
+    owns_local_user
+        && device.jid.device == local_device.device
+        && (device.jid.is_same_user_as(&participant.jid)
+            || participant
+                .pn
+                .as_ref()
+                .is_some_and(|pn| device.jid.is_same_user_as(pn)))
+}
+
+/// Whether a roster's relay block is usable for media: a valid warp tag width, a non-empty key and
+/// token, and an endpoint with a parseable IPv4 and a non-zero port.
+///
+/// Pure validation, so the control plane can reject an unusable relay snapshot with the engine off.
+/// The engine's richer form additionally derives the allocate material; this checks everything that
+/// can make a snapshot invalid without touching crypto.
+pub(crate) fn validate_group_relay_update(update: &GroupCallUpdate) -> Result<(), ()> {
+    use crate::voip_control::relay_parse::WEB_CLIENT_RELAY_PORT;
+
+    let Some(relay) = update.relay.as_ref() else {
+        return Ok(());
+    };
+    let warp_mi_tag_len = relay.warp_mi_tag_len.unwrap_or(4);
+    if !(1..=20).contains(&warp_mi_tag_len) || relay.key.is_empty() {
+        return Err(());
+    }
+    let usable = |endpoint: &&crate::types::group_call::GroupCallRelayEndpoint| {
+        !endpoint.is_fna
+            && endpoint.ipv4.is_some()
+            && endpoint.port.is_some_and(|port| port != 0)
+            && relay
+                .tokens
+                .get(endpoint.token_id as usize)
+                .is_some_and(|token| !token.is_empty())
+    };
+    let endpoint = relay
+        .endpoints
+        .iter()
+        .filter(usable)
+        .find(|endpoint| endpoint.port == Some(WEB_CLIENT_RELAY_PORT))
+        .or_else(|| relay.endpoints.iter().find(usable))
+        .ok_or(())?;
+    let ipv4 = endpoint.ipv4.as_deref().ok_or(())?;
+    ipv4.parse::<std::net::Ipv4Addr>().map_err(|_| ())?;
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::types::group_call::{GroupCallDevice, GroupCallParticipant, GroupCallRelay};
-    use crate::voip::ssrc::{derive_wasm_participant_ssrc, format_e2e_srtp_participant_id};
+    use crate::voip_control::ssrc::{derive_wasm_participant_ssrc, format_e2e_srtp_participant_id};
     use wacore_binary::Server;
 
     fn creator() -> Jid {

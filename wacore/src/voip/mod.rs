@@ -5,7 +5,9 @@
 //! tests pass even when both directions are wrong identically, so known-answer vectors are
 //! the only real guard.
 
-pub mod app_data;
+// RTC app-data envelope encoding moved to the neutral contract so the registry validates a
+// reaction without the engine. Re-exported for the historical path.
+pub use crate::voip_control::app_data;
 pub mod audio;
 // The content corroborator is an internal decision, not API: exposing it would invite a consumer to
 // make codec choices from payload bytes, which is the reflex this whole module exists to avoid. Not
@@ -17,22 +19,40 @@ pub mod demux;
 pub mod driver;
 pub mod e2e_srtp;
 pub mod engine;
-pub mod group;
 pub mod group_audio;
 pub mod group_media;
+// The group-call membership/control state moved to the neutral contract so the registry names it
+// without the engine. Re-exported for `crate::voip::group`.
+pub use crate::voip_control::group;
 pub mod h264;
 pub mod hbh_srtp;
-pub mod media_stats;
+// The resident media session moved to the neutral contract (`crate::voip_control::resident_session`):
+// it holds only the neutral command mailboxes, so the registry can store it without the engine.
+// Re-exported for the historical `crate::voip::media_session` path.
+pub use crate::voip_control::resident_session as media_session;
+// The per-call counters and the audio-health watchdog now live in the neutral contract
+// (`crate::voip_control::media_stats`): `CallMediaStats` is the seam's `MediaStats`, so the engine
+// and a foreign backend count the same fields. Re-exported so the historical `crate::voip::*` paths
+// and the watchdog's module path keep resolving.
+pub use crate::voip_control::media_stats;
 #[cfg(feature = "voip-mlow")]
 pub mod mlow;
 pub mod opus_packet;
-pub mod registry;
-pub mod relay_parse;
+// The call registry moved to the neutral contract (`crate::voip_control::registry`): it stores
+// `Arc<dyn VoipMediaSession>` and names no engine type. Re-exported for `crate::voip::registry`.
+pub use crate::voip_control::registry;
+// Relay `<relay>` parsing belongs to the control plane, not the engine: a call's signaling reads it
+// to decide where media will go, and the registry needs `RelayData` without the engine. Moved to
+// `crate::voip_control::relay_parse`; re-exported so the historical `crate::voip::relay_parse` path
+// resolves.
+pub use crate::voip_control::relay_parse;
 pub mod rtcp;
 pub mod rtp;
 pub mod session;
 pub mod sframe;
-pub mod ssrc;
+// SSRC derivation and participant-LID formatting moved to the neutral contract so the registry can
+// compute a participant SSRC without the engine. Re-exported for `crate::voip::ssrc`.
+pub use crate::voip_control::ssrc;
 pub mod stun;
 // Packet-capture facility: decorate a `RelayTransportFactory` with `TappedFactory` and every relay
 // datagram in both directions reaches your `PacketTap`. Public so that seam exists at all -- it was
@@ -40,7 +60,10 @@ pub mod stun;
 // of a dump. Note that the runtime does not yet expose a factory injection point for a live call,
 // so today this is reachable from a shell that builds its own transport, not from `CallHandle`.
 pub mod tap;
-pub mod transport;
+// The relay-transport seam now lives in the neutral contract (`crate::voip_control::transport`),
+// because a foreign backend supplies its own transport and must be able to name these traits with
+// the engine off. Re-exported here so the historical `wacore::voip::*` paths keep resolving.
+pub use crate::voip_control::transport;
 pub mod warp;
 
 // Curated facade: the headline entry points a consumer reaches for, hoisted to `voip::`.
@@ -95,41 +118,9 @@ pub use transport::{
 // from these would silently produce a broken (or insecure) stack. They stay reachable only as
 // `#[doc(hidden)]` in their source modules so the in-tree benchmark crate can drive them.
 
-/// HKDF-SHA256 (extract with `salt`, expand with `info`): the one KDF shape all of
-/// WhatsApp's VoIP key derivations reduce to.
-pub(crate) fn hkdf_sha256(salt: &[u8], ikm: &[u8], info: &[u8], len: usize) -> Vec<u8> {
-    debug_assert!(len <= 255 * 32, "HKDF-SHA256 max output is 8160 bytes");
-    crate::crypto::hkdf_sha256(ikm, len, Some(salt), info).expect("HKDF length within bounds")
-}
-
-/// Device-qualified participant id used as HKDF `info` for both E2E-SRTP and SFrame: strip the
-/// resource, keep an existing `:N@lid` device suffix, give bare `@lid` an implicit `:0`, and pass
-/// everything else through unchanged.
-pub(crate) fn format_participant_id(jid: &str) -> String {
-    let bare = jid.split('/').next().unwrap_or(jid).trim();
-    let Some(at) = bare.rfind('@') else {
-        return bare.to_string();
-    };
-    if at == 0 {
-        return bare.to_string();
-    }
-    let user = &bare[..at];
-    let domain = &bare[at + 1..];
-    if domain == "lid" && !user.contains(':') {
-        return format!("{user}:0@{domain}");
-    }
-    bare.to_string()
-}
-
-/// LEB128 varint append (`SFrame` header + DC STUN attributes use the same encoding).
-pub(crate) fn encode_varint(out: &mut Vec<u8>, value: u64) {
-    let mut v = value;
-    while v > 0x7f {
-        out.push(((v & 0x7f) | 0x80) as u8);
-        v >>= 7;
-    }
-    out.push((v & 0xff) as u8);
-}
+// The pure KDF and JID helpers moved to the neutral contract (`crate::voip_control::kdf`) so the
+// registry can name them without the engine. Re-exported for the historical paths.
+pub(crate) use crate::voip_control::kdf::{encode_varint, format_participant_id, hkdf_sha256};
 
 #[cfg(test)]
 pub(crate) mod testkat {

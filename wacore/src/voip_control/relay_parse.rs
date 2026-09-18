@@ -3,10 +3,13 @@
 //!
 //! wacrg spec: relay-candidates (REL-01), stun-relay (REL-02).
 
-use crate::voip::hbh_srtp::HBH_KEY_LEN;
 use base64::prelude::*;
 use std::collections::HashMap;
 use wacore_binary::NodeRef;
+
+/// Length of the `<hbh_key>` material: a 14-byte salt seed plus a 16-byte key seed. A wire constant,
+/// so it lives with the parser that validates it; the HBH SRTP module names it from here.
+pub(crate) const HBH_KEY_LEN: usize = 30;
 
 /// Default relay port from a te2 endpoint (0x0D96).
 pub const WHATSAPP_RELAY_PORT: u16 = 3478;
@@ -438,6 +441,19 @@ pub fn get_primary_ipv4_address(endpoint: &RelayEndpoint) -> Option<(String, u16
         .find_map(|a| a.ipv4.clone().map(|ip| (ip, a.port)))
 }
 
+/// The endpoint's `<auth_token>`, or empty when the relay carries no matching one.
+///
+/// No special case for id 0: it is an ordinary index that `auth_token_id` defaults to when the
+/// attribute is absent, so skipping it would blank the credential for the most common shape of
+/// offer. An empty or absent slot answers empty, the honest "there is no token here".
+pub fn select_auth_token(auth_tokens: &[Vec<u8>], auth_token_id: u32) -> Vec<u8> {
+    auth_tokens
+        .get(auth_token_id as usize)
+        .filter(|token| !token.is_empty())
+        .cloned()
+        .unwrap_or_default()
+}
+
 /// ice-ufrag for the synthetic SDP: base64 of the raw auth_token bytes.
 pub fn token_to_ice_ufrag(token_bytes: &[u8]) -> String {
     if token_bytes.is_empty() {
@@ -452,6 +468,16 @@ pub fn get_relay_key_for_sdp(relay_data: &RelayData) -> String {
         Some(k) if !k.is_empty() => BASE64_STANDARD.encode(k),
         _ => String::new(),
     }
+}
+
+/// Find the first `<relay>` node anywhere in the subtree (the offer's relay may sit under `<call>`
+/// or `<offer>` depending on server framing). Pure node walking, so it lives with the relay parser
+/// and compiles without the engine.
+pub fn find_relay<'a, 'b>(nr: &'b NodeRef<'a>) -> Option<&'b NodeRef<'a>> {
+    if nr.tag.as_ref() == "relay" {
+        return Some(nr);
+    }
+    nr.children().and_then(|cs| cs.iter().find_map(find_relay))
 }
 
 #[cfg(test)]
