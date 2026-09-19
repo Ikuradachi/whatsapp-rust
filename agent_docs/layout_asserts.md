@@ -45,6 +45,13 @@ Exact, kept exact:
   Stated as `Vec + MessageField == 4 * size_of::<usize>()`, width
   independent. This is the pin that matters there.
 
+Relative bounds:
+
+- Compact mutation-MAC entries in `wacore/src/store/in_memory.rs` must save
+  at least one `usize` over the former growable-container entry.
+  `mutation_mac_entry_layout_is_smaller_without_capacity_words` compares
+  the actual entry types without assuming private struct or tuple layouts.
+
 Budgets, asserted with `<=`:
 
 - `Slot<DispatchKey, DispatchClaim>` under the spelled-out-identity slot in
@@ -113,6 +120,7 @@ cargo test -p wacore-libsignal --target i686-unknown-linux-gnu --lib sender_key_
 cargo test -p wacore-binary --lib the_hint_tape_stays_five_bytes_wide
 cargo test -p wacore --lib a_device_entry_is_eight_bytes
 cargo test -p wacore --lib a_device_list_record_fits_sixty_four_bytes
+cargo test -p wacore --lib mutation_mac_entry_layout_is_smaller_without_capacity_words
 cargo test -p wacore --lib sparse_result_layout_stays_bounded
 cargo test -p wacore --lib retained_bytes_per_participant_stay_bounded
 cargo test -p whatsapp-rust --lib flattened_slot_reuses_entry_tail_padding
