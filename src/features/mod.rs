@@ -70,13 +70,14 @@ pub use contacts::{
 pub use events::{EventCreationParams, EventResponseType, Events};
 
 pub use groups::{
-    BatchGroupResult, CreateGroupResult, GroupAppealStatus, GroupCreateOptions, GroupDescription,
-    GroupEphemeralSettings, GroupError, GroupJoinError, GroupMessageReporter, GroupMetadata,
-    GroupParticipant, GroupParticipantDetails, GroupParticipantOptions, GroupPictureEntry,
-    GroupProfilePicture, GroupProfilePictureOutcome, GroupSubject, Groups, GrowthLockInfo,
-    InviteInfoError, JoinGroupResult, MemberAddMode, MemberLinkMode, MemberShareHistoryMode,
-    MembershipApprovalMode, MembershipRequest, ParticipantChangeResponse, ParticipantType,
-    PictureType, PreviousDescription, ReportedGroupMessage, ReportedGroupMessages,
+    CreateGroupResult, GroupAppealStatus, GroupCreateOptions, GroupDescription,
+    GroupEphemeralSettings, GroupError, GroupHierarchy, GroupJoinError, GroupMessageReporter,
+    GroupMetadata, GroupMetadataResult, GroupOverview, GroupOverviewResult, GroupParticipant,
+    GroupParticipantDetails, GroupParticipantOptions, GroupPictureEntry, GroupProfilePicture,
+    GroupProfilePictureOutcome, GroupSubject, Groups, GrowthLockInfo, InviteInfoError,
+    JoinGroupResult, MemberAddMode, MemberLinkMode, MemberShareHistoryMode, MembershipApprovalMode,
+    MembershipRequest, ParticipantChangeResponse, ParticipantType, PictureType,
+    PreviousDescription, ReportedGroupMessage, ReportedGroupMessages, SubgroupKind,
 };
 
 pub use labels::Labels;
