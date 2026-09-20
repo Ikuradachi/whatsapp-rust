@@ -6,6 +6,7 @@
 
 use crate::appstate_sync::Mutation;
 use crate::client::Client;
+use crate::client::{AppStateDispatchOutcome, fingerprint_id, redact_jid};
 use anyhow::Result;
 use log::debug;
 use thiserror::Error;
@@ -79,14 +80,22 @@ pub fn message_key(
     }
 }
 
-/// Returns `true` if handled, `false` if unknown (so other handlers can try).
-pub(crate) fn dispatch_chat_mutation(
+/// Dispatch inbound chat mutations, returning the [`AppStateDispatchOutcome`]
+/// for the semantic per-mutation log line. A new WhatsApp command that falls
+/// through every handler shows up as `Unclaimed` instead of vanishing
+/// silently. Never log a `SyncActionValue` through this: it can carry names,
+/// message text, contacts and salts.
+///
+/// `event_full_sync` is public event provenance (lands on
+/// `*.from_full_sync`); it is never a logging level (see
+/// `dispatch_app_state_mutation_inner`).
+pub(crate) fn dispatch_chat_mutation_outcome(
     event_bus: &wacore::types::events::CoreEventBus,
     m: &mut Mutation,
-    full_sync: bool,
-) -> bool {
+    event_full_sync: bool,
+) -> AppStateDispatchOutcome {
     if m.index.is_empty() {
-        return false;
+        return AppStateDispatchOutcome::Unclaimed;
     }
 
     let kind = &m.index[0];
@@ -94,12 +103,15 @@ pub(crate) fn dispatch_chat_mutation(
     // `contact` is the one chat action whose deletion arrives as a syncd
     // `Remove` (WAWebContactSync branches on `operation === "remove"`); every
     // other kind here encodes its "off" state inside a `Set` value, so a
-    // non-`Set` operation on one of them is not ours to interpret.
-    let is_contact_remove = m.operation == wa::syncd_mutation::SyncdOperation::REMOVE
-        && kind == "contact"
-        && m.index.len() > 1;
+    // non-`Set` operation on one of them is not ours to interpret. The
+    // operation gates the claim — not the index length: a `REMOVE contact`
+    // with no JID is still a contact removal, and the missing-JID branch
+    // below reports it as `Skipped` rather than misrouting it to `Unclaimed`
+    // (no other dispatcher owns contact removals).
+    let is_contact_remove =
+        m.operation == wa::syncd_mutation::SyncdOperation::REMOVE && kind == "contact";
     if m.operation != wa::syncd_mutation::SyncdOperation::SET && !is_contact_remove {
-        return false;
+        return AppStateDispatchOutcome::Unclaimed;
     }
 
     if !matches!(
@@ -118,7 +130,7 @@ pub(crate) fn dispatch_chat_mutation(
             | "userStatusMute"
             | "deleteMessageForMe"
     ) {
-        return false;
+        return AppStateDispatchOutcome::Unclaimed;
     }
 
     let ts = m
@@ -131,17 +143,20 @@ pub(crate) fn dispatch_chat_mutation(
         match m.index[1].parse() {
             Ok(j) => j,
             Err(_) => {
+                // Fingerprinted: the wire value failed validation, so it is
+                // untrusted input — never logged verbatim. The semantic line
+                // already carries the protected target.
                 log::warn!(
-                    "Skipping chat mutation '{}': malformed JID '{}'",
+                    "Skipping chat mutation '{}': malformed JID ({})",
                     kind,
-                    m.index[1]
+                    fingerprint_id(&m.index[1])
                 );
-                return true;
+                return AppStateDispatchOutcome::Skipped("malformed-jid");
             }
         }
     } else {
         log::warn!("Skipping chat mutation '{}': missing JID in index", kind);
-        return true;
+        return AppStateDispatchOutcome::Skipped("missing-jid");
     };
 
     match kind.as_str() {
@@ -154,11 +169,13 @@ pub(crate) fn dispatch_chat_mutation(
                         .jid(jid)
                         .timestamp(time)
                         .action(Box::new(act))
-                        .from_full_sync(full_sync)
+                        .from_full_sync(event_full_sync)
                         .build(),
                 ));
+                AppStateDispatchOutcome::Event("MuteUpdate")
+            } else {
+                AppStateDispatchOutcome::Malformed("MuteUpdate")
             }
-            true
         }
         "pin" | "pin_v1" => {
             if let Some(val) = &mut m.action_value
@@ -169,11 +186,13 @@ pub(crate) fn dispatch_chat_mutation(
                         .jid(jid)
                         .timestamp(time)
                         .action(Box::new(act))
-                        .from_full_sync(full_sync)
+                        .from_full_sync(event_full_sync)
                         .build(),
                 ));
+                AppStateDispatchOutcome::Event("PinUpdate")
+            } else {
+                AppStateDispatchOutcome::Malformed("PinUpdate")
             }
-            true
         }
         "archive" => {
             if let Some(val) = &mut m.action_value
@@ -184,17 +203,26 @@ pub(crate) fn dispatch_chat_mutation(
                         .jid(jid)
                         .timestamp(time)
                         .action(Box::new(act))
-                        .from_full_sync(full_sync)
+                        .from_full_sync(event_full_sync)
                         .build(),
                 ));
+                AppStateDispatchOutcome::Event("ArchiveUpdate")
+            } else {
+                AppStateDispatchOutcome::Malformed("ArchiveUpdate")
             }
-            true
         }
         "star" => {
+            // Index first: it borrows nothing, so a short index or a bad
+            // participant JID is reported as `Skipped` without touching the
+            // action. Taking the action first would consume it and then blame
+            // a missing `starAction` for what was really a bad index.
+            let Some((message_id, from_me, participant_jid)) =
+                parse_message_key_fields(kind, &m.index)
+            else {
+                return AppStateDispatchOutcome::Skipped("bad-message-key");
+            };
             if let Some(val) = &mut m.action_value
                 && let Some(act) = val.star_action.take()
-                && let Some((message_id, from_me, participant_jid)) =
-                    parse_message_key_fields(kind, &m.index)
             {
                 event_bus.dispatch(Event::StarUpdate(
                     StarUpdate::builder()
@@ -204,21 +232,23 @@ pub(crate) fn dispatch_chat_mutation(
                         .from_me(from_me)
                         .timestamp(time)
                         .action(Box::new(act))
-                        .from_full_sync(full_sync)
+                        .from_full_sync(event_full_sync)
                         .build(),
                 ));
+                AppStateDispatchOutcome::Event("StarUpdate")
+            } else {
+                AppStateDispatchOutcome::Malformed("StarUpdate")
             }
-            true
         }
         "contact" if is_contact_remove => {
             event_bus.dispatch(Event::ContactRemoved(
                 ContactRemoved::builder()
                     .jid(jid)
                     .timestamp(time)
-                    .from_full_sync(full_sync)
+                    .from_full_sync(event_full_sync)
                     .build(),
             ));
-            true
+            AppStateDispatchOutcome::Event("ContactRemoved")
         }
         "contact" => {
             if let Some(val) = &mut m.action_value
@@ -229,11 +259,13 @@ pub(crate) fn dispatch_chat_mutation(
                         .jid(jid)
                         .timestamp(time)
                         .action(Box::new(act))
-                        .from_full_sync(full_sync)
+                        .from_full_sync(event_full_sync)
                         .build(),
                 ));
+                AppStateDispatchOutcome::Event("ContactUpdate")
+            } else {
+                AppStateDispatchOutcome::Malformed("ContactUpdate")
             }
-            true
         }
         "mark_chat_as_read" | "markChatAsRead" => {
             if let Some(val) = &mut m.action_value
@@ -244,11 +276,13 @@ pub(crate) fn dispatch_chat_mutation(
                         .jid(jid)
                         .timestamp(time)
                         .action(Box::new(act))
-                        .from_full_sync(full_sync)
+                        .from_full_sync(event_full_sync)
                         .build(),
                 ));
+                AppStateDispatchOutcome::Event("MarkChatAsReadUpdate")
+            } else {
+                AppStateDispatchOutcome::Malformed("MarkChatAsReadUpdate")
             }
-            true
         }
         "deleteChat" => {
             if let Some(val) = &mut m.action_value
@@ -262,11 +296,13 @@ pub(crate) fn dispatch_chat_mutation(
                         .delete_media(delete_media)
                         .timestamp(time)
                         .action(Box::new(act))
-                        .from_full_sync(full_sync)
+                        .from_full_sync(event_full_sync)
                         .build(),
                 ));
+                AppStateDispatchOutcome::Event("DeleteChatUpdate")
+            } else {
+                AppStateDispatchOutcome::Malformed("DeleteChatUpdate")
             }
-            true
         }
         "clearChat" => {
             if let Some(val) = &mut m.action_value
@@ -284,11 +320,13 @@ pub(crate) fn dispatch_chat_mutation(
                         .delete_media(delete_media)
                         .timestamp(time)
                         .action(Box::new(act))
-                        .from_full_sync(full_sync)
+                        .from_full_sync(event_full_sync)
                         .build(),
                 ));
+                AppStateDispatchOutcome::Event("ClearChatUpdate")
+            } else {
+                AppStateDispatchOutcome::Malformed("ClearChatUpdate")
             }
-            true
         }
         "lock" => {
             if let Some(val) = &m.action_value
@@ -299,11 +337,13 @@ pub(crate) fn dispatch_chat_mutation(
                         .jid(jid)
                         .timestamp(time)
                         .action(Box::new(act.clone()))
-                        .from_full_sync(full_sync)
+                        .from_full_sync(event_full_sync)
                         .build(),
                 ));
+                AppStateDispatchOutcome::Event("LockChatUpdate")
+            } else {
+                AppStateDispatchOutcome::Malformed("LockChatUpdate")
             }
-            true
         }
         "userStatusMute" => {
             if let Some(val) = &mut m.action_value
@@ -315,17 +355,24 @@ pub(crate) fn dispatch_chat_mutation(
                         .muted(act.muted.unwrap_or(false))
                         .timestamp(time)
                         .action(Box::new(act))
-                        .from_full_sync(full_sync)
+                        .from_full_sync(event_full_sync)
                         .build(),
                 ));
+                AppStateDispatchOutcome::Event("UserStatusMuteUpdate")
+            } else {
+                AppStateDispatchOutcome::Malformed("UserStatusMuteUpdate")
             }
-            true
         }
         "deleteMessageForMe" => {
+            // Same ordering as `star` above: validate the index before taking
+            // the action, or a bad index invents a missing-action diagnosis.
+            let Some((message_id, from_me, participant_jid)) =
+                parse_message_key_fields(kind, &m.index)
+            else {
+                return AppStateDispatchOutcome::Skipped("bad-message-key");
+            };
             if let Some(val) = &mut m.action_value
                 && let Some(act) = val.delete_message_for_me_action.take()
-                && let Some((message_id, from_me, participant_jid)) =
-                    parse_message_key_fields(kind, &m.index)
             {
                 event_bus.dispatch(Event::DeleteMessageForMeUpdate(
                     DeleteMessageForMeUpdate::builder()
@@ -335,13 +382,15 @@ pub(crate) fn dispatch_chat_mutation(
                         .from_me(from_me)
                         .timestamp(time)
                         .action(Box::new(act))
-                        .from_full_sync(full_sync)
+                        .from_full_sync(event_full_sync)
                         .build(),
                 ));
+                AppStateDispatchOutcome::Event("DeleteMessageForMeUpdate")
+            } else {
+                AppStateDispatchOutcome::Malformed("DeleteMessageForMeUpdate")
             }
-            true
         }
-        _ => false,
+        _ => AppStateDispatchOutcome::Unclaimed,
     }
 }
 
@@ -362,8 +411,8 @@ fn parse_message_key_fields(kind: &str, index: &[String]) -> Option<(String, boo
             Ok(j) => Some(j),
             Err(_) => {
                 log::warn!(
-                    "Skipping {kind} mutation: malformed participant JID '{}'",
-                    index[4]
+                    "Skipping {kind} mutation: malformed participant JID ({})",
+                    fingerprint_id(&index[4])
                 );
                 return None;
             }
@@ -456,7 +505,7 @@ impl<'a> ChatActions<'a> {
         jid: &Jid,
         message_range: Option<SyncActionMessageRange>,
     ) -> Result<(), AppStateError> {
-        debug!("Archiving chat {jid}");
+        debug!("Archiving chat {}", redact_jid(jid));
         self.send_archive_mutation(jid, true, message_range).await
     }
 
@@ -465,22 +514,22 @@ impl<'a> ChatActions<'a> {
         jid: &Jid,
         message_range: Option<SyncActionMessageRange>,
     ) -> Result<(), AppStateError> {
-        debug!("Unarchiving chat {jid}");
+        debug!("Unarchiving chat {}", redact_jid(jid));
         self.send_archive_mutation(jid, false, message_range).await
     }
 
     pub async fn pin_chat(&self, jid: &Jid) -> Result<(), AppStateError> {
-        debug!("Pinning chat {jid}");
+        debug!("Pinning chat {}", redact_jid(jid));
         self.send_pin_mutation(jid, true).await
     }
 
     pub async fn unpin_chat(&self, jid: &Jid) -> Result<(), AppStateError> {
-        debug!("Unpinning chat {jid}");
+        debug!("Unpinning chat {}", redact_jid(jid));
         self.send_pin_mutation(jid, false).await
     }
 
     pub async fn mute_chat(&self, jid: &Jid) -> Result<(), AppStateError> {
-        debug!("Muting chat {jid} indefinitely");
+        debug!("Muting chat {} indefinitely", redact_jid(jid));
         self.send_mute_mutation(jid, true, MUTE_INDEFINITE).await
     }
 
@@ -501,25 +550,28 @@ impl<'a> ChatActions<'a> {
                 "mute_end_timestamp_ms is in the past ({mute_end_timestamp_ms} <= {now_ms})"
             )));
         }
-        debug!("Muting chat {jid} until {mute_end_timestamp_ms}");
+        debug!(
+            "Muting chat {} until {mute_end_timestamp_ms}",
+            redact_jid(jid)
+        );
         self.send_mute_mutation(jid, true, mute_end_timestamp_ms)
             .await
     }
 
     pub async fn unmute_chat(&self, jid: &Jid) -> Result<(), AppStateError> {
-        debug!("Unmuting chat {jid}");
+        debug!("Unmuting chat {}", redact_jid(jid));
         self.send_mute_mutation(jid, false, 0).await
     }
 
     /// Chat lock: moves the chat into the account's "locked chats" folder.
     /// Only the lock state syncs; no message or key leaves the device.
     pub async fn lock_chat(&self, jid: &Jid) -> Result<(), AppStateError> {
-        debug!("Locking chat {jid}");
+        debug!("Locking chat {}", redact_jid(jid));
         self.send_lock_mutation(jid, true).await
     }
 
     pub async fn unlock_chat(&self, jid: &Jid) -> Result<(), AppStateError> {
-        debug!("Unlocking chat {jid}");
+        debug!("Unlocking chat {}", redact_jid(jid));
         self.send_lock_mutation(jid, false).await
     }
 
@@ -531,7 +583,11 @@ impl<'a> ChatActions<'a> {
         message_id: &str,
         from_me: bool,
     ) -> Result<(), AppStateError> {
-        debug!("Starring message {message_id} in {chat_jid}");
+        debug!(
+            "Starring message {} in {}",
+            fingerprint_id(message_id),
+            redact_jid(chat_jid)
+        );
         self.send_star_mutation(chat_jid, participant_jid, message_id, from_me, true)
             .await
     }
@@ -543,7 +599,11 @@ impl<'a> ChatActions<'a> {
         message_id: &str,
         from_me: bool,
     ) -> Result<(), AppStateError> {
-        debug!("Unstarring message {message_id} in {chat_jid}");
+        debug!(
+            "Unstarring message {} in {}",
+            fingerprint_id(message_id),
+            redact_jid(chat_jid)
+        );
         self.send_star_mutation(chat_jid, participant_jid, message_id, from_me, false)
             .await
     }
@@ -556,7 +616,8 @@ impl<'a> ChatActions<'a> {
         message_range: Option<SyncActionMessageRange>,
     ) -> Result<(), AppStateError> {
         debug!(
-            "Marking chat {jid} as {}",
+            "Marking chat {} as {}",
+            redact_jid(jid),
             if read { "read" } else { "unread" }
         );
         let value = wa::SyncActionValue {
@@ -581,7 +642,7 @@ impl<'a> ChatActions<'a> {
         delete_media: bool,
         message_range: Option<SyncActionMessageRange>,
     ) -> Result<(), AppStateError> {
-        debug!("Deleting chat {jid}");
+        debug!("Deleting chat {}", redact_jid(jid));
         let delete_media_str = if delete_media { "1" } else { "0" };
         let value = wa::SyncActionValue {
             delete_chat_action: buffa::MessageField::some(
@@ -613,7 +674,7 @@ impl<'a> ChatActions<'a> {
         delete_media: bool,
         message_range: Option<SyncActionMessageRange>,
     ) -> Result<(), AppStateError> {
-        debug!("Clearing chat {jid}");
+        debug!("Clearing chat {}", redact_jid(jid));
         // WA Web's $ClearChatSync$p_3 encodes both flags as "1"/"0".
         let delete_starred_str = if delete_starred { "1" } else { "0" };
         let delete_media_str = if delete_media { "1" } else { "0" };
@@ -637,7 +698,7 @@ impl<'a> ChatActions<'a> {
     /// Mute or unmute a contact/group/newsletter's status updates across devices
     /// (WA Web's userStatusMute). `muted = true` hides their status.
     pub async fn set_user_status_mute(&self, jid: &Jid, muted: bool) -> Result<(), AppStateError> {
-        debug!("Setting userStatusMute for {jid} -> {muted}");
+        debug!("Setting userStatusMute for {} -> {muted}", redact_jid(jid));
         let value = wa::SyncActionValue {
             user_status_mute_action: buffa::MessageField::some(
                 wa::sync_action_value::UserStatusMuteAction { muted: Some(muted) },
@@ -662,7 +723,11 @@ impl<'a> ChatActions<'a> {
         delete_media: bool,
         message_timestamp: Option<i64>,
     ) -> Result<(), AppStateError> {
-        debug!("Deleting message {message_id} for me in {chat_jid}");
+        debug!(
+            "Deleting message {} for me in {}",
+            fingerprint_id(message_id),
+            redact_jid(chat_jid)
+        );
         let (chat, participant) = message_key_owned(chat_jid, participant_jid, from_me)?;
         let value = wa::SyncActionValue {
             delete_message_for_me_action: buffa::MessageField::some(
@@ -710,7 +775,7 @@ impl<'a> ChatActions<'a> {
                 "save_contact: contact id must be a bare phone-number JID (not a LID, group, or device-specific JID)".into(),
             ));
         }
-        debug!("Saving contact {jid}");
+        debug!("Saving contact {}", redact_jid(jid));
         let value = wa::SyncActionValue {
             contact_action: buffa::MessageField::some(wa::sync_action_value::ContactAction {
                 full_name,
@@ -747,7 +812,7 @@ impl<'a> ChatActions<'a> {
                 "remove_contact: contact id must be a bare phone-number JID (not a LID, group, or device-specific JID)".into(),
             ));
         }
-        debug!("Removing contact {jid}");
+        debug!("Removing contact {}", redact_jid(jid));
         let value = wa::SyncActionValue {
             contact_action: buffa::MessageField::some(
                 wa::sync_action_value::ContactAction::default(),
@@ -1274,8 +1339,8 @@ mod registry_tests {
             .and_then(|v| v.timestamp)
             .expect("the removal stamps its value with a timestamp");
 
-        let (handled, events) = dispatch_into_recorder(&mutation);
-        assert!(handled);
+        let (outcome, events) = dispatch_outcome_into_recorder(&mutation);
+        assert!(outcome != AppStateDispatchOutcome::Unclaimed);
         assert_eq!(events.len(), 1);
         match &*events[0] {
             Event::ContactRemoved(u) => {
@@ -1289,7 +1354,7 @@ mod registry_tests {
         }
 
         // ...and a full-sync replay is marked as one.
-        let (_, events) = dispatch_into_recorder_with(&mutation, true);
+        let (_, events) = dispatch_outcome_into_recorder_with(&mutation, true);
         match &*events[0] {
             Event::ContactRemoved(u) => assert!(u.from_full_sync),
             other => panic!("expected ContactRemoved, got {other:?}"),
@@ -1310,9 +1375,26 @@ mod registry_tests {
                 ..Default::default()
             }),
         };
-        let (handled, events) = dispatch_into_recorder(&m);
-        assert!(handled);
+        let (outcome, events) = dispatch_outcome_into_recorder(&m);
+        assert!(outcome != AppStateDispatchOutcome::Unclaimed);
         assert!(matches!(&*events[0], Event::ContactUpdate(_)));
+    }
+
+    #[test]
+    fn a_contact_remove_without_jid_is_skipped_not_unclaimed() {
+        // `contact` owns the Remove operation regardless of index length:
+        // a bare `REMOVE contact` is a malformed contact mutation (the
+        // missing-JID branch reports `Skipped`), never an unknown command.
+        // No other dispatcher owns contact removals, so `Unclaimed` here
+        // would misroute it and mute the specific warning.
+        let m = Mutation {
+            index: vec!["contact".into()],
+            operation: wa::syncd_mutation::SyncdOperation::REMOVE,
+            action_value: Some(wa::SyncActionValue::default()),
+        };
+        let (outcome, events) = dispatch_outcome_into_recorder(&m);
+        assert_eq!(outcome, AppStateDispatchOutcome::Skipped("missing-jid"));
+        assert!(events.is_empty());
     }
 
     #[test]
@@ -1325,8 +1407,12 @@ mod registry_tests {
                 operation: wa::syncd_mutation::SyncdOperation::REMOVE,
                 action_value: Some(wa::SyncActionValue::default()),
             };
-            let (handled, events) = dispatch_into_recorder(&m);
-            assert!(!handled, "a Remove on '{kind}' must not be claimed");
+            let (outcome, events) = dispatch_outcome_into_recorder(&m);
+            assert_eq!(
+                outcome,
+                AppStateDispatchOutcome::Unclaimed,
+                "a Remove on '{kind}' must not be claimed"
+            );
             assert!(events.is_empty());
         }
     }
@@ -1362,8 +1448,8 @@ mod registry_tests {
                     ..Default::default()
                 }),
             };
-            let (handled, events) = dispatch_into_recorder(&m);
-            assert!(handled);
+            let (outcome, events) = dispatch_outcome_into_recorder(&m);
+            assert!(outcome != AppStateDispatchOutcome::Unclaimed);
             match &*events[0] {
                 Event::LockChatUpdate(u) => {
                     assert_eq!(u.action.locked, Some(locked));
@@ -1392,8 +1478,8 @@ mod registry_tests {
             &["lock".to_string(), "12025550111@s.whatsapp.net".to_string()]
         );
 
-        let (handled, events) = dispatch_into_recorder(&mutation);
-        assert!(handled);
+        let (outcome, events) = dispatch_outcome_into_recorder(&mutation);
+        assert!(outcome != AppStateDispatchOutcome::Unclaimed);
         match &*events[0] {
             Event::LockChatUpdate(u) => {
                 assert_eq!(u.jid, jid);
@@ -1403,14 +1489,11 @@ mod registry_tests {
         }
     }
 
-    fn dispatch_into_recorder(m: &Mutation) -> (bool, Vec<std::sync::Arc<Event>>) {
-        dispatch_into_recorder_with(m, false)
-    }
-
-    fn dispatch_into_recorder_with(
+    /// Outcome-level dispatch: the single `AppStateDispatchOutcome` contract
+    /// tells "event emitted" apart from "known command, payload absent".
+    fn dispatch_outcome_into_recorder(
         m: &Mutation,
-        full_sync: bool,
-    ) -> (bool, Vec<std::sync::Arc<Event>>) {
+    ) -> (AppStateDispatchOutcome, Vec<std::sync::Arc<Event>>) {
         use std::sync::{Arc, Mutex};
         use wacore::types::events::{CoreEventBus, EventHandler, EventInterest};
 
@@ -1428,9 +1511,89 @@ mod registry_tests {
         let seen: Arc<Mutex<Vec<Arc<Event>>>> = Arc::new(Mutex::new(Vec::new()));
         bus.subscribe_handler(Arc::new(Recorder(seen.clone())))
             .detach();
-        let handled = dispatch_chat_mutation(&bus, &mut m.clone(), full_sync);
+        let outcome = dispatch_chat_mutation_outcome(&bus, &mut m.clone(), false);
         let events = seen.lock().unwrap().clone();
-        (handled, events)
+        (outcome, events)
+    }
+
+    /// `handled=true` used to mean "an event was created"; a known command
+    /// with its action missing took the same path. The outcome tells them
+    /// apart: the mutation is still claimed (no other dispatcher owns
+    /// `archive`), but no event exists.
+    #[test]
+    fn known_command_with_missing_action_is_malformed_not_an_event() {
+        let m = Mutation {
+            index: vec!["archive".to_string(), "120363000000000042@g.us".to_string()],
+            operation: wa::syncd_mutation::SyncdOperation::SET,
+            action_value: Some(wa::SyncActionValue {
+                timestamp: Some(1_700_000_000_000),
+                ..Default::default()
+            }),
+        };
+        let (outcome, events) = dispatch_outcome_into_recorder(&m);
+        assert_eq!(outcome, AppStateDispatchOutcome::Malformed("ArchiveUpdate"));
+        assert!(events.is_empty());
+        // …while still claimed, so dispatch keeps routing it to no one else.
+        assert!(outcome != AppStateDispatchOutcome::Unclaimed);
+    }
+
+    /// An unknown command is unclaimed: the dispatcher below must still get
+    /// its turn. This is what makes a new WhatsApp mutation visible as
+    /// `unhandled` instead of silently absorbed.
+    #[test]
+    fn unknown_command_is_unclaimed() {
+        let m = Mutation {
+            index: vec![
+                "some_new_whatsapp_action".to_string(),
+                "120363000000000042@g.us".to_string(),
+            ],
+            operation: wa::syncd_mutation::SyncdOperation::SET,
+            action_value: Some(wa::SyncActionValue {
+                timestamp: Some(1_700_000_000_000),
+                ..Default::default()
+            }),
+        };
+        let (outcome, events) = dispatch_outcome_into_recorder(&m);
+        assert_eq!(outcome, AppStateDispatchOutcome::Unclaimed);
+        assert!(events.is_empty());
+    }
+
+    /// An empty index names no command; nothing can route it.
+    #[test]
+    fn empty_index_is_unclaimed() {
+        let m = Mutation {
+            index: vec![],
+            operation: wa::syncd_mutation::SyncdOperation::SET,
+            action_value: None,
+        };
+        let (outcome, _) = dispatch_outcome_into_recorder(&m);
+        assert_eq!(outcome, AppStateDispatchOutcome::Unclaimed);
+    }
+
+    fn dispatch_outcome_into_recorder_with(
+        m: &Mutation,
+        full_sync: bool,
+    ) -> (AppStateDispatchOutcome, Vec<std::sync::Arc<Event>>) {
+        use std::sync::{Arc, Mutex};
+        use wacore::types::events::{CoreEventBus, EventHandler, EventInterest};
+
+        struct Recorder(Arc<Mutex<Vec<Arc<Event>>>>);
+        impl EventHandler for Recorder {
+            fn handle_event(&self, event: Arc<Event>) {
+                self.0.lock().unwrap().push(event);
+            }
+            fn interest(&self) -> EventInterest {
+                EventInterest::ALL
+            }
+        }
+
+        let bus = CoreEventBus::new();
+        let seen: Arc<Mutex<Vec<Arc<Event>>>> = Arc::new(Mutex::new(Vec::new()));
+        bus.subscribe_handler(Arc::new(Recorder(seen.clone())))
+            .detach();
+        let outcome = dispatch_chat_mutation_outcome(&bus, &mut m.clone(), full_sync);
+        let events = seen.lock().unwrap().clone();
+        (outcome, events)
     }
 
     #[test]
