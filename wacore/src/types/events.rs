@@ -1480,6 +1480,32 @@ pub struct InboundMessage {
     pub comment_target: Option<Box<wa::MessageKey>>,
 }
 
+impl InboundMessage {
+    /// Borrow addressing and origin metadata, without cloning either protobuf.
+    pub fn message_ref(
+        &self,
+    ) -> Result<super::message_ref::MessageRef<'_>, super::message_ref::MessageRefError> {
+        self.try_into()
+    }
+
+    /// Newsletter envelopes retain independent optional client/server ids.
+    /// Generic live envelopes do not establish author ownership, so `from_me`
+    /// remains unknown rather than promoting the parser's default `false`.
+    pub fn newsletter_ref(
+        &self,
+    ) -> Result<super::message_ref::NewsletterMessageRef<'_>, super::message_ref::MessageRefError>
+    {
+        use super::message_ref::{MessageId, NewsletterMessageRef, ServerMessageId};
+        NewsletterMessageRef::new(
+            &self.info.source.chat,
+            (!self.info.id.is_empty())
+                .then(|| MessageId::new(self.info.id.as_str()))
+                .transpose()?,
+            self.info.newsletter_server_id.map(ServerMessageId::new),
+        )
+    }
+}
+
 /// How a [`MessageBatch`] was delivered. This describes the delivery shape,
 /// not a message's provenance: whether a stanza came from the offline queue
 /// is `info.is_offline` on each [`InboundMessage`].
@@ -1573,6 +1599,17 @@ pub struct NewsletterLiveUpdateMessage {
     /// How many times the message was forwarded. `None` when the node is
     /// absent, which is not the same as a count of zero.
     pub forwards_count: Option<u64>,
+}
+
+impl NewsletterLiveUpdateMessage {
+    /// Counter updates identify content by server id only, not client id.
+    pub fn message_ref<'a>(
+        &self,
+        chat: &'a Jid,
+    ) -> Result<super::message_ref::NewsletterMessageRef<'a>, super::message_ref::MessageRefError>
+    {
+        super::message_ref::NewsletterMessageRef::new(chat, None, Some(self.server_id.into()))
+    }
 }
 
 /// A reaction count in a newsletter live update.
@@ -2439,6 +2476,16 @@ pub struct ServerAck {
     /// Nack code (e.g. `"479"`) when the server rejected the stanza; `None`
     /// for a plain ack.
     pub error: Option<String>,
+}
+
+impl ServerAck {
+    /// The acknowledged operation's id, not its target content id. Check class,
+    /// chat and `error` separately; an ACK does not prove recipient delivery.
+    pub fn stanza_id(
+        &self,
+    ) -> Result<super::message_ref::StanzaId, super::message_ref::MessageRefError> {
+        super::message_ref::StanzaId::new(&self.id)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, bon::Builder)]

@@ -30,6 +30,9 @@ use waproto::whatsapp as wa;
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum NewsletterError {
+    /// Invalid or missing target identifiers, rejected before network work.
+    #[error("{0}")]
+    MessageRef(#[from] crate::MessageRefError),
     /// A MEX (GraphQL) query/mutation failed or returned malformed data.
     #[error("{0}")]
     Mex(#[from] MexError),
@@ -434,6 +437,24 @@ pub struct NewsletterMessage {
     pub rcat: Option<Vec<u8>>,
 }
 
+impl NewsletterMessage {
+    /// Borrow the channel while copying only the short id, not the message
+    /// body. History requires a server id; an omitted client id stays absent.
+    pub fn message_ref<'a>(
+        &self,
+        chat: &'a Jid,
+    ) -> Result<crate::NewsletterMessageRef<'a>, crate::MessageRefError> {
+        crate::NewsletterMessageRef::new(
+            chat,
+            (!self.message_id.is_empty())
+                .then(|| crate::MessageId::new(&self.message_id))
+                .transpose()?,
+            Some(self.server_id.into()),
+        )
+        .map(|r| r.with_from_me(self.is_sender))
+    }
+}
+
 /// Feature handle for newsletter (channel) operations.
 pub struct Newsletter<'a> {
     client: &'a Client,
@@ -828,6 +849,54 @@ impl<'a> Newsletter<'a> {
             .unwrap_or(300);
 
         Ok(duration)
+    }
+
+    /// React using only the target's server content id. Returns the NEW
+    /// operation stanza id for ACK correlation, not a delivery guarantee.
+    pub async fn send_reaction_ref(
+        &self,
+        target: &crate::NewsletterMessageRef<'_>,
+        reaction: &str,
+    ) -> Result<crate::StanzaId, NewsletterError> {
+        let server_id = target.require_server_id()?;
+        let id = self
+            .send_reaction(target.chat(), server_id.get(), reaction)
+            .await?;
+        Ok(crate::StanzaId::new(id)?)
+    }
+
+    /// Replace a poll selection using only the poll's server content id.
+    pub async fn send_poll_vote_ref(
+        &self,
+        target: &crate::NewsletterMessageRef<'_>,
+        option_hashes: &[[u8; 32]],
+    ) -> Result<crate::StanzaId, NewsletterError> {
+        let server_id = target.require_server_id()?;
+        let id = self
+            .send_poll_vote(target.chat(), server_id.get(), option_hashes)
+            .await?;
+        Ok(crate::StanzaId::new(id)?)
+    }
+
+    /// Edit using only the target's client content id, never its server id.
+    /// The legacy chat/string overload remains an explicit raw escape.
+    pub async fn edit_message_ref(
+        &self,
+        target: &crate::NewsletterMessageRef<'_>,
+        new_content: wa::Message,
+    ) -> Result<(), NewsletterError> {
+        let id = target.require_message_id()?;
+        self.edit_message(target.chat(), id.as_str(), new_content)
+            .await
+    }
+
+    /// Revoke using only the target's client content id, never its server id.
+    pub async fn revoke_message_ref(
+        &self,
+        target: &crate::NewsletterMessageRef<'_>,
+    ) -> Result<(), NewsletterError> {
+        let id = target.require_message_id()?;
+        self.revoke_message(target.chat(), id.as_str()).await
     }
 
     /// Send a reaction to a newsletter message.
@@ -2658,6 +2727,31 @@ mod tests {
 
         let msgs = parse_newsletter_messages_response(&response.as_node_ref()).unwrap();
         assert_eq!(msgs[0].message_type, NewsletterMessageType::Media);
+    }
+
+    #[test]
+    fn review_parsed_history_reference_preserves_known_ownership() {
+        let chat = newsletter_jid();
+        for is_sender in [false, true] {
+            let response = history_response(vec![
+                NodeBuilder::new("message")
+                    .attr("id", "HISTORY_CLIENT_CONTENT")
+                    .attr("server_id", u64::MAX)
+                    .attr("t", "123")
+                    .attr("is_sender", if is_sender { "true" } else { "false" })
+                    .build(),
+            ]);
+            let messages = parse_newsletter_messages_response(&response.as_node_ref()).unwrap();
+            assert_eq!(messages.len(), 1);
+            let target = messages[0].message_ref(&chat).unwrap();
+            assert_eq!(target.from_me(), Some(is_sender));
+            assert_eq!(
+                target.message_id().unwrap().as_str(),
+                "HISTORY_CLIENT_CONTENT"
+            );
+            assert_eq!(target.server_id().unwrap().get(), u64::MAX);
+            assert!(std::ptr::eq(target.chat(), &chat));
+        }
     }
 
     /// Wrap message nodes in the `<iq><messages>` envelope the server answers

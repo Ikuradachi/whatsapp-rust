@@ -41,6 +41,9 @@ pub(crate) use tctoken_lifecycle::is_own_identity;
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum SendError {
+    /// Invalid or incomplete target addressing, rejected before sending.
+    #[error("{0}")]
+    MessageRef(#[from] crate::MessageRefError),
     /// Connection/transport/IQ failure (embeds the shared base error).
     // No `#[from]`: the manual `From<ClientError>` impl flattens a bare `?` so
     // `NotLoggedIn`/`Iq` stay matchable instead of nesting under `Client(..)`.
@@ -972,6 +975,37 @@ pub struct SendResult {
 }
 
 impl SendResult {
+    /// Reference the emitted message, not the original target of an edit,
+    /// revoke or add-on. Its body stays in the existing Arc, untouched. For
+    /// newsletter plaintext sends use `newsletter_ref` instead.
+    pub fn message_ref(&self) -> Result<crate::MessageRef<'_>, crate::MessageRefError> {
+        crate::MessageRef::new(
+            &self.to,
+            crate::MessageId::new(&self.message_id)?,
+            None,
+            true,
+        )
+    }
+
+    /// A freshly sent newsletter post has a client id but no server id until
+    /// learned from the server. This result does not manufacture that id.
+    pub fn newsletter_ref(
+        &self,
+    ) -> Result<crate::NewsletterMessageRef<'_>, crate::MessageRefError> {
+        crate::NewsletterMessageRef::new(
+            &self.to,
+            Some(crate::MessageId::new(&self.message_id)?),
+            None,
+        )
+        .map(|r| r.with_from_me(true))
+    }
+
+    /// Outer operation id for ACK correlation. For edits/revokes this is NOT
+    /// the original target id; an ACK match does not prove recipient delivery.
+    pub fn stanza_id(&self) -> Result<crate::StanzaId, crate::MessageRefError> {
+        crate::StanzaId::new(&self.message_id)
+    }
+
     /// `participant` is `None` -- only valid for the sender's own messages.
     pub fn message_key(&self) -> wa::MessageKey {
         wa::MessageKey {
@@ -3971,6 +4005,7 @@ pub(crate) fn dm_stanza_to(recipient_bare: &Jid, to: &Jid) -> Jid {
 #[cfg(all(test, not(target_arch = "wasm32")))]
 #[allow(clippy::disallowed_methods)]
 mod tests {
+    mod message_reference_tests;
     mod privacy_tokens;
 
     use super::*;
@@ -8460,6 +8495,14 @@ mod tests {
     /// session for the peer's LID device so the offline fanout can encrypt
     /// without a socket. Returns `(peer_pn, peer_lid)`.
     async fn seed_dm_wire_namespace_state(client: &Arc<Client>) -> (Jid, Jid) {
+        let peer_lid: Jid = "555000000000777@lid".parse().unwrap();
+        seed_dm_wire_namespace_state_for_peer_lid(client, peer_lid).await
+    }
+
+    async fn seed_dm_wire_namespace_state_for_peer_lid(
+        client: &Arc<Client>,
+        peer_lid: Jid,
+    ) -> (Jid, Jid) {
         use wacore::libsignal::protocol::{
             IdentityKeyPair, KeyPair, PreKeyBundle, SignalProtocolError, UsePQRatchet,
             process_prekey_bundle,
@@ -8484,7 +8527,6 @@ mod tests {
         // The peer is LID-mapped: the wire namespace is then decided solely by
         // the account's migration state.
         let peer_pn: Jid = "100000000000777@s.whatsapp.net".parse().unwrap();
-        let peer_lid: Jid = "555000000000777@lid".parse().unwrap();
         client
             .add_lid_pn_mapping(
                 peer_lid.user.as_str(),

@@ -1,6 +1,95 @@
 use super::*;
 
 impl Client {
+    pub(crate) async fn message_ref_addon_key(
+        &self,
+        target: &crate::MessageRef<'_>,
+    ) -> Result<wa::MessageKey, SendError> {
+        let mut key = target.to_raw_key();
+        // Add-ons carry the original group author, not their own sender. A
+        // borrowed own-send reference lacks that author; resolve it here without
+        // the raw identity helper's fallback on unavailable routing/LID state.
+        if target.chat().is_group() && target.from_me() && key.participant.is_none() {
+            let routing = self.groups().routing_info(target.chat()).await?;
+            let own = self.persistence_manager.get_device_snapshot();
+            let author = match routing.addressing_mode {
+                AddressingMode::Pn => own.pn.as_ref().ok_or(SendError::NotLoggedIn)?,
+                AddressingMode::Lid => own
+                    .lid
+                    .as_ref()
+                    .ok_or(crate::MessageRefError::MissingSender)?,
+            };
+            key.participant = Some(author.to_non_ad_string());
+        }
+        Ok(key)
+    }
+
+    /// Revoke using the original author/from-me scope. Own messages use a
+    /// sender revoke (no participant); other authors require group admin
+    /// rights, checked by the server. The reference grants no permissions.
+    pub async fn revoke_message_ref(
+        &self,
+        target: &crate::MessageRef<'_>,
+    ) -> Result<SendResult, SendError> {
+        target.require_chat_operation()?;
+        let kind = if target.from_me() {
+            RevokeType::Sender
+        } else {
+            if !target.chat().is_group() {
+                return Err(crate::MessageRefError::UnsupportedOrigin.into());
+            }
+            RevokeType::Admin {
+                original_sender: target
+                    .sender()
+                    .ok_or(crate::MessageRefError::MissingSender)?
+                    .clone(),
+            }
+        };
+        self.revoke_message(target.chat(), target.id().as_str(), kind)
+            .await
+    }
+
+    /// Keep/unkeep the addressed message. The raw chat/key overload remains
+    /// available as `keep_message` for advanced hosts.
+    pub async fn keep_message_ref(
+        &self,
+        target: &crate::MessageRef<'_>,
+        keep: bool,
+    ) -> Result<SendResult, SendError> {
+        target.require_chat_operation()?;
+        self.keep_message(
+            target.chat(),
+            self.message_ref_addon_key(target).await?,
+            keep,
+        )
+        .await
+    }
+
+    /// Pin the addressed message with a fresh operation id.
+    pub async fn pin_message_ref(
+        &self,
+        target: &crate::MessageRef<'_>,
+        duration: PinDuration,
+    ) -> Result<SendResult, SendError> {
+        target.require_chat_operation()?;
+        self.pin_message(
+            target.chat(),
+            self.message_ref_addon_key(target).await?,
+            duration,
+        )
+        .await
+    }
+
+    /// Unpin the addressed message with a fresh operation id.
+    pub async fn unpin_message_ref(
+        &self,
+        target: &crate::MessageRef<'_>,
+    ) -> Result<SendResult, SendError> {
+        target.require_chat_operation()?;
+        self.unpin_message(target.chat(), self.message_ref_addon_key(target).await?)
+            .await
+    }
+
     /// Delete a message for everyone in the chat (revoke).
     ///
     /// This sends a revoke protocol message that removes the message for all participants.
