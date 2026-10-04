@@ -15745,6 +15745,103 @@ mod pdo_alias_tests {
         }
     }
 
+    #[test]
+    fn pdo_alias_fingerprint_excludes_only_top_level_processed_skdm() {
+        use sha2::{Digest, Sha256};
+        let base = wa::Message {
+            conversation: Some("synthetic body".into()),
+            ..Default::default()
+        };
+        let skdm = wa::message::SenderKeyDistributionMessage {
+            group_id: Some("120363000000000073@g.us".into()),
+            axolotl_sender_key_distribution_message: Some(vec![0xAB; 64]),
+        };
+        let mut carrier = base.clone();
+        carrier.sender_key_distribution_message = buffa::MessageField::some(skdm.clone());
+        let expected = MessageDispatch::fingerprint(&base);
+        assert_eq!(MessageDispatch::fingerprint(&carrier), expected);
+        carrier
+            .sender_key_distribution_message
+            .as_option_mut()
+            .unwrap()
+            .axolotl_sender_key_distribution_message = Some(vec![0xCD; 64]);
+        assert_eq!(
+            MessageDispatch::fingerprint(&carrier),
+            expected,
+            "a changed distribution is still not new user content"
+        );
+        let wire = waproto::codec::message_to_vec(&carrier);
+        assert_ne!(
+            MessageDispatch::truncate(Sha256::digest(&wire).into()),
+            expected
+        );
+        assert!(
+            carrier.sender_key_distribution_message.is_set(),
+            "fingerprinting must not mutate the event"
+        );
+
+        carrier.fast_ratchet_key_sender_key_distribution_message =
+            buffa::MessageField::some(skdm.clone());
+        assert_ne!(
+            MessageDispatch::fingerprint(&carrier),
+            expected,
+            "legacy fast-ratchet equivalence is unproven"
+        );
+        let mut inner_without_skdm = carrier.clone();
+        inner_without_skdm.sender_key_distribution_message.take();
+        let nested_without_skdm = wa::Message {
+            ephemeral_message: buffa::MessageField::some(wa::message::FutureProofMessage {
+                message: buffa::MessageField::some(inner_without_skdm),
+            }),
+            ..Default::default()
+        };
+        let nested = wa::Message {
+            ephemeral_message: buffa::MessageField::some(wa::message::FutureProofMessage {
+                message: buffa::MessageField::some(carrier),
+            }),
+            ..Default::default()
+        };
+        assert_ne!(
+            MessageDispatch::fingerprint(&nested),
+            MessageDispatch::fingerprint(&nested_without_skdm),
+            "otherwise identical wrappers must retain the inner SKDM difference"
+        );
+
+        // Unknown fields and a field-2 value with the wrong wire type remain
+        // part of the payload; only the known length-delimited SKDM is omitted.
+        let mut wire = waproto::codec::message_to_vec(&base);
+        wire.extend_from_slice(&[0xC0, 0x3E, 0x01]);
+        // Test the encoded projection directly: the existing Message decoder
+        // discards unknown fields, so a decode/re-encode is not this oracle.
+        let unknown_expected = MessageDispatch::truncate(Sha256::digest(&wire).into());
+        assert_ne!(unknown_expected, expected);
+        let mut carrier = base;
+        carrier.sender_key_distribution_message = buffa::MessageField::some(skdm);
+        let mut encoded = waproto::codec::message_to_vec(&carrier);
+        encoded.extend_from_slice(&[0xC0, 0x3E, 0x01]);
+        assert_eq!(
+            MessageDispatch::fingerprint_encoded(&encoded, true),
+            unknown_expected
+        );
+        encoded.extend_from_slice(&[0x10, 0x01]);
+        wire.extend_from_slice(&[0x10, 0x01]);
+        assert_eq!(
+            MessageDispatch::fingerprint_encoded(&encoded, true),
+            MessageDispatch::truncate(Sha256::digest(&wire).into())
+        );
+    }
+
+    #[test]
+    fn pdo_alias_fingerprint_malformed_encoding_keeps_every_byte() {
+        use sha2::{Digest, Sha256};
+        for bytes in [&[0x12, 0xFF][..], &[0x0A, 0x04, 0x01], &[0x00]] {
+            assert_eq!(
+                MessageDispatch::fingerprint_encoded(bytes, true),
+                MessageDispatch::truncate(Sha256::digest(bytes).into())
+            );
+        }
+    }
+
     #[derive(Clone, Copy)]
     enum Shape {
         Incoming,
@@ -16826,6 +16923,437 @@ impl PdoRetryFixture {
             Some("\u{1f980}ping")
         );
         decrypted
+    }
+}
+
+// Synthetic, not the reporter's P/R1/R2: real Signal decrypt, PDO response and
+// event publication isolate SKDM from outer reporting and functional context.
+#[tokio::test]
+async fn pdo_retry_skdm_equivalence_preserves_distinct_user_payloads() {
+    use buffa::Message as _;
+    use wacore::types::events::ChannelEventHandler;
+
+    #[derive(Default)]
+    struct Hook {
+        calls: std::sync::atomic::AtomicUsize,
+        skdm: std::sync::atomic::AtomicUsize,
+    }
+    #[async_trait::async_trait]
+    impl crate::types::durability_hook::InboundDurabilityHook for Hook {
+        async fn on_messages(
+            &self,
+            _: Arc<Client>,
+            messages: &[wacore::types::events::InboundMessage],
+        ) -> anyhow::Result<()> {
+            for message in messages
+                .iter()
+                .filter(|m| m.info.id == "COUNTERFACTUAL_MESSAGE")
+            {
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                if message.message.sender_key_distribution_message.is_set() {
+                    self.skdm.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            Ok(())
+        }
+    }
+
+    for case in 0..56 {
+        let with_hook = case % 14 >= 7;
+        let offline = case % 28 >= 14;
+        let with_pdo = case < 28;
+        let variant = case % 7;
+        for order in [[0, 1, 2], [1, 0, 2], [1, 2, 0]] {
+            let (client, transport) = capturing_client("issue1634_counterfactual").await;
+            client
+                .persistence_manager
+                .process_command(crate::store::commands::DeviceCommand::SetLid(Some(
+                    "777000000000001:1@lid".parse().unwrap(),
+                )))
+                .await;
+            let mut phone = AlicePeer::new("777000000000001@lid").await;
+            let (phone_bundle, receiver) = bobs_prekey_bundle(&client).await;
+            phone
+                .install_bob_session(&receiver.to_protocol_address(), &phone_bundle)
+                .await;
+            let establish = phone
+                .encrypt_text(&receiver.to_protocol_address(), "phone setup")
+                .await;
+            process_session_ct(
+                &client,
+                &phone.jid,
+                "COUNTERFACTUAL_PHONE_SETUP",
+                &establish,
+            )
+            .await;
+            phone
+                .sessions
+                .0
+                .get_mut(&receiver.to_protocol_address())
+                .unwrap()
+                .session_state_mut()
+                .unwrap()
+                .clear_unacknowledged_pre_key_message();
+            // Retire the phone's consumed test prekey before the helper reuses
+            // that ID for the independent sender session.
+            client.flush_signal_cache().await.unwrap();
+
+            let hook = Arc::new(Hook::default());
+            if with_hook {
+                client
+                    .inbound_durability_hook
+                    .set(hook.clone())
+                    .ok()
+                    .unwrap();
+            }
+            let group: Jid = "120363000000000073@g.us".parse().unwrap();
+            let mut sender = AlicePeer::new("777000000000003:2@lid").await;
+            let (bundle, _) = bobs_prekey_bundle(&client).await;
+            sender
+                .install_bob_session(&receiver.to_protocol_address(), &bundle)
+                .await;
+            let p = wa::Message {
+                conversation: Some("synthetic ping".into()),
+                ..Default::default()
+            };
+            let skdm = sender.create_group_skdm(&group).await;
+            let failed = group_skmsg_stanza(
+                &group,
+                &sender.jid.to_non_ad(),
+                "COUNTERFACTUAL_MESSAGE",
+                sender
+                    .encrypt_group_message(&group, &MessageUtils::encode_and_pad(&p))
+                    .await,
+            );
+            let mut r1 = p.clone();
+            if variant != 0 {
+                r1.sender_key_distribution_message = buffa::MessageField::some(skdm);
+            }
+            let mut r2 = r1.clone();
+            let mut rotated_chain_id = None;
+            match variant {
+                1 => {
+                    // Same-ID distributions deliberately do not reset a known
+                    // chain. Rotate to a new valid chain instead: its followup
+                    // can only decrypt if the suppressed retry2 processed it.
+                    let name =
+                        make_sender_key_name(&group, &sender.jid.to_non_ad().to_protocol_address());
+                    let old = sender.sender_keys.0.remove(&name).unwrap();
+                    let old_id = old.sender_key_state().unwrap().chain_id();
+                    let newer = loop {
+                        let distribution = sender.create_group_skdm(&group).await;
+                        let new_id = sender
+                            .sender_keys
+                            .0
+                            .get(&name)
+                            .unwrap()
+                            .sender_key_state()
+                            .unwrap()
+                            .chain_id();
+                        if new_id != old_id {
+                            rotated_chain_id = Some(new_id);
+                            break distribution;
+                        }
+                        sender.sender_keys.0.remove(&name);
+                    };
+                    assert_ne!(
+                        r1.sender_key_distribution_message
+                            .as_option()
+                            .unwrap()
+                            .axolotl_sender_key_distribution_message,
+                        newer.axolotl_sender_key_distribution_message
+                    );
+                    r2.sender_key_distribution_message = buffa::MessageField::some(newer);
+                }
+                2 => {
+                    r2.message_context_info = buffa::MessageField::some(wa::MessageContextInfo {
+                        reporting_token_version: Some(2),
+                        ..Default::default()
+                    })
+                }
+                3 => r2.conversation = Some("distinct multipart body".into()),
+                4 => {
+                    r2.conversation = None;
+                    r2.reaction_message = buffa::MessageField::some(wa::message::ReactionMessage {
+                        key: buffa::MessageField::some(wa::MessageKey {
+                            remote_jid: Some(group.to_string()),
+                            id: Some("REACTION_PARENT".into()),
+                            ..Default::default()
+                        }),
+                        text: Some("❤️".into()),
+                        ..Default::default()
+                    });
+                }
+                5 => {
+                    r2.conversation = None;
+                    r2.protocol_message = buffa::MessageField::some(wa::message::ProtocolMessage {
+                        r#type: Some(wa::message::protocol_message::Type::MESSAGE_EDIT),
+                        key: buffa::MessageField::some(wa::MessageKey {
+                            remote_jid: Some(group.to_string()),
+                            id: Some("EDIT_PARENT".into()),
+                            ..Default::default()
+                        }),
+                        edited_message: buffa::MessageField::some(wa::Message {
+                            conversation: Some("edited body".into()),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    });
+                }
+                6 => {
+                    r2.message_context_info = buffa::MessageField::some(wa::MessageContextInfo {
+                        message_secret: Some(vec![0xCD; 32]),
+                        ..Default::default()
+                    })
+                }
+                _ => {}
+            }
+            assert_eq!(
+                MessageDispatch::fingerprint(&p),
+                MessageDispatch::fingerprint(&r1)
+            );
+            assert_eq!(
+                MessageDispatch::fingerprint(&r1) == MessageDispatch::fingerprint(&r2),
+                variant < 2
+            );
+            let mut retries = Vec::new();
+            for (index, message) in [r1, r2].iter().enumerate() {
+                let ct = sender
+                    .encrypt(
+                        &receiver.to_protocol_address(),
+                        &MessageUtils::encode_and_pad(message),
+                    )
+                    .await;
+                let payload = enc_payload_from_ciphertext(&ct);
+                assert_eq!(payload.enc_type, EncType::PreKeyMessage);
+                let mut children = vec![
+                    NodeBuilder::new("enc")
+                        .attr("type", payload.enc_type.as_wire_str())
+                        .attr("v", "2")
+                        .attr("count", "1")
+                        .bytes(payload.ciphertext.to_vec())
+                        .build(),
+                ];
+                if index == 1 {
+                    children.push(
+                        NodeBuilder::new("reporting")
+                            .children([NodeBuilder::new("reporting_token")
+                                .attr("v", "2")
+                                .bytes(vec![0xAB; 32])
+                                .build()])
+                            .build(),
+                    );
+                }
+                retries.push(node_to_arc(
+                    NodeBuilder::new("message")
+                        .attr("from", group.clone())
+                        .attr("participant", sender.jid.clone())
+                        .attr("id", "COUNTERFACTUAL_MESSAGE")
+                        .attr("t", wacore::time::now_secs().to_string())
+                        .attr("type", "text")
+                        .attr("addressing_mode", "lid")
+                        .children(children)
+                        .build(),
+                ));
+            }
+            let (handler, events) = ChannelEventHandler::new();
+            client.core.event_bus.subscribe_handler(handler).detach();
+            let _payloads = client.acquire_decrypted_payload_forwarding();
+            client.clone().handle_incoming_message(failed).await;
+            crate::test_utils::wait_for_outbound_tasks(&client).await;
+            let pending_key = wacore::types::message::ChatMessageId::new(
+                group.clone(),
+                "COUNTERFACTUAL_MESSAGE".into(),
+            );
+            let request_id = client
+                .pdo_pending_requests
+                .get(&pending_key)
+                .await
+                .unwrap()
+                .1
+                .request_id
+                .clone();
+            assert_eq!(
+                retry_receipt_key_bundles_for(&transport.sent(), "COUNTERFACTUAL_MESSAGE").len(),
+                1
+            );
+            let recovered = wa::WebMessageInfo {
+                key: buffa::MessageField::some(wa::MessageKey {
+                    remote_jid: Some(group.to_string()),
+                    from_me: Some(false),
+                    id: Some("COUNTERFACTUAL_MESSAGE".into()),
+                    participant: Some(sender.jid.to_non_ad().to_string()),
+                }),
+                message: buffa::MessageField::some(p),
+                ..Default::default()
+            };
+            let response = wa::message::PeerDataOperationRequestResponseMessage {
+                stanza_id: Some(request_id),
+                peer_data_operation_result: vec![wa::message::peer_data_operation_request_response_message::PeerDataOperationResult {
+                    placeholder_message_resend_response: buffa::MessageField::some(
+                        wa::message::peer_data_operation_request_response_message::peer_data_operation_result::PlaceholderMessageResendResponse {
+                            web_message_info_bytes: Some(recovered.encode_to_vec()),
+                        }),
+                    ..Default::default()
+                }], ..Default::default()
+            };
+            let pdo =
+                PdoRetryFixture::encode_phone_response(&mut phone, &receiver, &response).await;
+            if offline {
+                client.inbound_commit_batch.reset();
+            }
+            for leg in order {
+                if leg == 0 && !with_pdo {
+                    continue;
+                }
+                let node = if leg == 0 {
+                    pdo.clone()
+                } else {
+                    retries[leg - 1].clone()
+                };
+                client.clone().handle_incoming_message(node).await;
+            }
+            if let Some(expected_chain_id) = rotated_chain_id {
+                let snapshot = client.persistence_manager.get_device_snapshot();
+                let name =
+                    make_sender_key_name(&group, &sender.jid.to_non_ad().to_protocol_address());
+                let record = client
+                    .signal_cache
+                    .get_sender_key(&name, &*snapshot.backend)
+                    .await
+                    .unwrap()
+                    .expect("rotated retry SKDM installed");
+                assert_eq!(
+                    record.sender_key_state().unwrap().chain_id(),
+                    expected_chain_id,
+                    "retry2 must apply its rotated distribution before event suppression"
+                );
+            }
+            if variant != 0 {
+                // Even a suppressed retry must install its SKDM: a subsequent
+                // sender-key message must decrypt without another recovery.
+                let followup = sender
+                    .encrypt_group_message(
+                        &group,
+                        &MessageUtils::encode_and_pad(&wa::Message {
+                            conversation: Some("after key recovery".into()),
+                            ..Default::default()
+                        }),
+                    )
+                    .await;
+                client
+                    .clone()
+                    .handle_incoming_message(group_skmsg_stanza(
+                        &group,
+                        &sender.jid.to_non_ad(),
+                        "COUNTERFACTUAL_FOLLOWUP",
+                        followup,
+                    ))
+                    .await;
+            }
+            if offline {
+                assert!(
+                    client
+                        .flush_inbound_commits_under_permit(true, None, None)
+                        .await
+                );
+            }
+            crate::test_utils::wait_for_outbound_tasks(&client).await;
+            let mut delivered = Vec::new();
+            let mut followups = 0;
+            let mut decrypted = 0;
+            let mut failures = Vec::new();
+            while let Ok(event) = events.try_recv() {
+                for message in event.messages() {
+                    if message.info.id == "COUNTERFACTUAL_MESSAGE" {
+                        delivered.push(message.message.clone());
+                    } else if message.info.id == "COUNTERFACTUAL_FOLLOWUP" {
+                        followups += 1;
+                    }
+                }
+                match event.as_ref() {
+                    Event::DecryptedPayload(payload)
+                        if payload.info.id == "COUNTERFACTUAL_MESSAGE" =>
+                    {
+                        assert_eq!(payload.enc_type, "pkmsg");
+                        decrypted += 1;
+                    }
+                    Event::EncDecryptFailed(failure)
+                        if failure.info.id == "COUNTERFACTUAL_MESSAGE" =>
+                    {
+                        failures.push(failure.reason);
+                    }
+                    _ => {}
+                }
+            }
+            assert_eq!(
+                decrypted, 2,
+                "both retries must actually decrypt: variant={variant}, order={order:?}, failures={failures:?}"
+            );
+            assert_eq!(
+                followups,
+                usize::from(variant != 0),
+                "SKDM processing must survive suppression"
+            );
+            assert_eq!(
+                delivered.len(),
+                if variant < 2 { 1 } else { 2 },
+                "variant={variant}, order={order:?}"
+            );
+            assert!(
+                delivered
+                    .iter()
+                    .any(|m| m.conversation.as_deref() == Some("synthetic ping"))
+            );
+            if with_hook {
+                assert_eq!(
+                    hook.calls.load(Ordering::Relaxed),
+                    if variant < 2 { 1 } else { 2 }
+                );
+                assert_eq!(
+                    hook.skdm.load(Ordering::Relaxed) != 0,
+                    variant != 0,
+                    "the hook must receive the unmodified SKDM carrier"
+                );
+            }
+            match variant {
+                2 => assert!(delivered.iter().any(|m| {
+                    m.message_context_info
+                        .as_option()
+                        .is_some_and(|ctx| ctx.reporting_token_version == Some(2))
+                })),
+                3 => assert!(
+                    delivered
+                        .iter()
+                        .any(|m| m.conversation.as_deref() == Some("distinct multipart body"))
+                ),
+                4 => assert!(delivered.iter().any(|m| {
+                    m.reaction_message
+                        .as_option()
+                        .is_some_and(|reaction| reaction.text.as_deref() == Some("❤️"))
+                })),
+                5 => assert!(
+                    delivered
+                        .iter()
+                        .any(|m| m.protocol_message.as_option().is_some_and(|edit| edit
+                            .edited_message
+                            .as_option()
+                            .is_some_and(
+                                |body| body.conversation.as_deref() == Some("edited body")
+                            )))
+                ),
+                6 => assert!(delivered.iter().any(|m| {
+                    m.message_context_info.as_option().is_some_and(|ctx| {
+                        ctx.message_secret.as_deref() == Some([0xCD; 32].as_slice())
+                    })
+                })),
+                _ => {}
+            }
+            println!(
+                "synthetic counterfactual: variant={variant}, with_hook={with_hook}, offline={offline}, with_pdo={with_pdo}, order={order:?}, decrypted={decrypted}, events={}",
+                delivered.len()
+            );
+        }
     }
 }
 

@@ -798,7 +798,17 @@ impl Client {
                 }
                 let candidate = candidate.get_or_insert_with(|| wire(&item.message));
                 let existing = k.encoded.get_or_insert_with(|| wire(&k.message));
-                if *existing == *candidate {
+                if *existing == *candidate
+                    || (k.message.sender_key_distribution_message.is_set()
+                        || item.message.sender_key_distribution_message.is_set())
+                        && MessageDispatch::fingerprint_encoded(
+                            existing,
+                            k.message.sender_key_distribution_message.is_set(),
+                        ) == MessageDispatch::fingerprint_encoded(
+                            candidate,
+                            item.message.sender_key_distribution_message.is_set(),
+                        )
+                {
                     return false;
                 }
             }
@@ -936,13 +946,15 @@ impl Client {
                     waproto::codec::message_encode_into(&item.message, arena);
                     ranges.push(start..arena.len());
                     if dispatch_gate {
-                        use sha2::{Digest, Sha256};
                         fingerprints.push(
                             (!crate::features::message_edit::carries_secret_encrypted(
                                 &item.message,
                             ))
                             .then(|| {
-                                MessageDispatch::truncate(Sha256::digest(&arena[start..]).into())
+                                MessageDispatch::fingerprint_encoded(
+                                    &arena[start..],
+                                    item.message.sender_key_distribution_message.is_set(),
+                                )
                             }),
                         );
                     }

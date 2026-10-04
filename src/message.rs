@@ -476,10 +476,43 @@ impl MessageDispatch {
         message: &wa::Message,
         scratch: &mut Vec<u8>,
     ) -> DispatchFingerprint {
-        use sha2::{Digest, Sha256};
         scratch.clear();
         waproto::codec::message_encode_into(message, scratch);
-        Self::truncate(Sha256::digest(scratch.as_slice()).into())
+        Self::fingerprint_encoded(scratch, message.sender_key_distribution_message.is_set())
+    }
+
+    /// SKDM is a protocol carrier, processed before dispatch admission: adding
+    /// it to a pairwise group resend must not publish the same user payload
+    /// again after PDO. Exclude only that top-level field, without changing the
+    /// event or persisted bytes. Context, wrappers and the legacy fast-ratchet
+    /// field remain significant; their recovery equivalence is not established.
+    /// Reuse the existing encoding rather than cloning Message or instantiating
+    /// another protobuf sink (the latter costs an entire encode tree).
+    #[inline(never)]
+    pub(crate) fn fingerprint_encoded(encoded: &[u8], has_skdm: bool) -> DispatchFingerprint {
+        use buffa::encoding::{Tag, WireType, skip_field_depth};
+        use sha2::{Digest, Sha256};
+        if !has_skdm {
+            return Self::truncate(Sha256::digest(encoded).into());
+        }
+        let mut digest = Sha256::new();
+        let mut remaining = encoded;
+        while !remaining.is_empty() {
+            let field = remaining;
+            let Ok(tag) = Tag::decode(&mut remaining) else {
+                return Self::truncate(Sha256::digest(encoded).into());
+            };
+            if skip_field_depth(tag, &mut remaining, buffa::RECURSION_LIMIT).is_err() {
+                // A malformed encoding cannot justify discarding bytes.
+                return Self::truncate(Sha256::digest(encoded).into());
+            }
+            if tag.field_number() != waproto::tags::message::SENDER_KEY_DISTRIBUTION_MESSAGE
+                || tag.wire_type() != WireType::LengthDelimited
+            {
+                digest.update(&field[..field.len() - remaining.len()]);
+            }
+        }
+        Self::truncate(digest.finalize().into())
     }
 
     /// The retained prefix of a full digest, for a caller that already hashed
