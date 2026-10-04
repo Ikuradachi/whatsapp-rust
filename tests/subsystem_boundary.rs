@@ -1,22 +1,17 @@
 //! A cuttable subsystem stays cut.
 //!
-//! `agent_docs/subsystem_boundary.md` classifies a subsystem as cuttable when
-//! the core neither holds its state nor runs its code inline, and gives the core
-//! a budget of two mentions for it: the `mod` declaration that brings the files
-//! in, and the entry in the subsystem list that routes to them. The failure
-//! this guards is the cheap one: a third mention, added because a `Client` field
-//! or an inline branch was the shortest path, and nothing objected. That is how
-//! the subsystems the same document classifies as coupled got to 314 `cfg`
-//! sites.
+//! This test gives a cuttable subsystem two core mentions: its module
+//! declaration and its subsystem-list entry. A third mention would scatter
+//! subsystem state or branches through the core. The broader ownership rule
+//! is in `agent_docs/architecture.md`; this file owns the mention budgets.
 //!
 //! It scans text, so it sees a mention in a comment too. That is deliberate: a
 //! comment in the core explaining what the subsystem needs is the same coupling
 //! one commit early.
 //!
 //! What it does not reach: the subsystem calling into core internals that exist
-//! only for it (test 3 of the rule), and anything outside this crate's `src/`.
-//! `Event` variants and payload types stay in `wacore` unconditionally by test 4
-//! of the rule, so a green run here does not claim the disabled build carries
+//! only for it, and anything outside this crate's `src/`.
+//! `Event` variants and payload types stay in `wacore` unconditionally to preserve public construction and persisted interest bits, so a green run here does not claim the disabled build carries
 //! zero bytes of the subsystem, only zero code, state and branches of its own.
 
 use std::path::{Path, PathBuf};
@@ -62,10 +57,9 @@ const CUTTABLE: &[Cuttable] = &[Cuttable {
 
 /// A subsystem the cut rule calls *coupled but disciplined*: it cannot leave the
 /// core, so it keeps gates there, and the only thing worth guarding is that the
-/// count does not creep back up. Weaker than [`Cuttable`] on purpose, and the
-/// batch that wrote `agent_docs/subsystem_boundary.md` needed it: it took VoIP
-/// from 29 gates outside its own files to 5, and nothing but this stops the
-/// next change from spending that back one field at a time.
+/// count does not creep back up. Weaker than [`Cuttable`] on purpose: coupled
+/// subsystems keep their required entry points but cannot add scattered gates
+/// without updating this explicit budget.
 struct Disciplined {
     /// The feature whose gates are counted.
     feature: &'static str,
@@ -175,8 +169,8 @@ fn a_disciplined_subsystem_does_not_creep_back_into_the_core() {
             "`{}` now has {} gates outside the files it owns, budget is {}:\n{}\n\n\
              Raising the budget is a decision, not a formality: the point of the \
              number is that a subsystem that cannot be cut still does not spread. \
-             If the new gate belongs, say why in agent_docs/subsystem_boundary.md \
-             and move the budget with it.",
+             If the new gate belongs, explain the new gate beside DISCIPLINED in this test \
+             and update its budget with that rationale.",
             subsystem.feature,
             gates.len(),
             subsystem.budget,
