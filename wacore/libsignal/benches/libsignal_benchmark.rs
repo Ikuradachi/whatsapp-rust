@@ -889,6 +889,100 @@ fn bench_sender_key_serialize_with_backlog(bencher: divan::Bencher) {
         .bench_refs(|record| black_box(record.serialize().expect("serialize sender key")));
 }
 
+/// A components consumer may retain a cache clone while exporting its record.
+#[divan::bench]
+fn bench_sender_key_export_shared_backlog(bencher: divan::Bencher) {
+    bencher
+        .with_inputs(|| {
+            let record = setup_sender_key_record(SERIALIZE_BACKLOG);
+            (Some(record.clone()), record)
+        })
+        .bench_refs(|(record, retained)| {
+            black_box(&*retained);
+            black_box(
+                record
+                    .take()
+                    .expect("record")
+                    .into_components()
+                    .expect("components"),
+            );
+        });
+}
+
+// These focused fixtures use independent RNG streams so adding benchmarks does
+// not shift the signing inputs of existing benchmarks through bench_rng's CTR.
+fn setup_sender_key_record(backlog: usize) -> SenderKeyRecord {
+    let mut rng = <rand::rngs::StdRng as rand::SeedableRng>::seed_from_u64(0x5345_4e44);
+    let pair = KeyPair::generate(&mut rng);
+    let mut record = SenderKeyRecord::new_empty();
+    record
+        .add_sender_key_state(
+            3,
+            7,
+            0,
+            &[0x11; 32],
+            pair.public_key,
+            Some(pair.private_key),
+        )
+        .expect("sender state");
+    let state = record.sender_key_state_mut().expect("sender state");
+    for _ in 0..backlog {
+        let chain = state.sender_chain_key().expect("chain");
+        state.add_sender_message_key(&chain.sender_message_key());
+        state.set_sender_chain_key(chain.next().expect("next chain"));
+    }
+    record
+}
+
+#[divan::bench]
+fn bench_sender_key_serialize_without_backlog(bencher: divan::Bencher) {
+    bencher
+        .with_inputs(|| setup_sender_key_record(0))
+        .bench_refs(|record| black_box(record.serialize().expect("serialize sender key")));
+}
+
+#[divan::bench(args = [false, true])]
+fn bench_session_with_self(bencher: divan::Bencher, is_self: bool) {
+    bencher
+        .with_inputs(|| {
+            let mut rng = <rand::rngs::StdRng as rand::SeedableRng>::seed_from_u64(0x5345_4c46);
+            let local = IdentityKey::new(KeyPair::generate(&mut rng).public_key);
+            let remote = if is_self {
+                local
+            } else {
+                IdentityKey::new(KeyPair::generate(&mut rng).public_key)
+            };
+            SessionState::new(
+                3,
+                &local,
+                &remote,
+                &RootKey::new([0x11; 32]),
+                local.public_key(),
+            )
+        })
+        .bench_refs(|state| black_box(state.session_with_self().expect("identities")));
+}
+
+#[divan::bench]
+fn bench_session_root_key_update(bencher: divan::Bencher) {
+    bencher
+        .with_inputs(|| {
+            let mut rng = <rand::rngs::StdRng as rand::SeedableRng>::seed_from_u64(0x524f_4f54);
+            let local = IdentityKey::new(KeyPair::generate(&mut rng).public_key);
+            SessionState::new(
+                3,
+                &local,
+                &local,
+                &RootKey::new([0x11; 32]),
+                local.public_key(),
+            )
+        })
+        .bench_refs(|state| {
+            state.set_root_key(black_box(&RootKey::new([0x22; 32])));
+            black_box(&*state);
+        });
+}
+
 fn setup_conversation_data() -> (User, User) {
     setup_dm_users()
 }
