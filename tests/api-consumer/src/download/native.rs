@@ -17,6 +17,58 @@ mod tests {
         async_trait, wacore, waproto as proto,
     };
 
+    #[test]
+    fn owned_metadata_constructors_reject_invalid_inputs() {
+        use whatsapp_rust::download::{DownloadPreparationError as Invalid, Downloadable};
+        let encrypted = |key: &[u8], plain: &[u8], cipher: &[u8], kind| {
+            DownloadParams::encrypted("/file", key, plain, cipher, 16, kind)
+        };
+        for length in [0, 31, 33] {
+            assert!(matches!(
+                encrypted(&vec![1; length], &[2; 32], &[3; 32], MediaType::Image),
+                Err(Invalid::InvalidMediaKeyLength)
+            ));
+            assert!(matches!(
+                encrypted(&[1; 32], &vec![2; length], &[3; 32], MediaType::Image),
+                Err(Invalid::InvalidPlaintextHashLength)
+            ));
+            assert!(matches!(
+                encrypted(&[1; 32], &[2; 32], &vec![3; length], MediaType::Image),
+                Err(Invalid::InvalidEncryptedHashLength)
+            ));
+            assert!(matches!(
+                DownloadParams::plaintext("/file", &vec![2; length], 16, MediaType::Image),
+                Err(Invalid::InvalidPlaintextHashLength)
+            ));
+        }
+        for kind in [
+            MediaType::NewsletterMusicArtwork,
+            MediaType::ProductCatalogImage,
+        ] {
+            assert!(matches!(
+                encrypted(&[1; 32], &[2; 32], &[3; 32], kind),
+                Err(Invalid::RequiresPlaintext)
+            ));
+            let params = DownloadParams::plaintext("/file", &[2; 32], 16, kind).unwrap();
+            assert!(!params.is_encrypted());
+            assert!(params.media_key().is_none());
+        }
+        assert!(matches!(
+            DownloadParams::plaintext("/file", &[2; 32], 16, MediaType::MusicArtwork),
+            Err(Invalid::RequiresEncryption)
+        ));
+        assert!(
+            encrypted(&[1; 32], &[2; 32], &[3; 32], MediaType::MusicArtwork)
+                .unwrap()
+                .is_encrypted()
+        );
+        assert!(
+            !DownloadParams::plaintext("/file", &[2; 32], 16, MediaType::Image)
+                .unwrap()
+                .is_encrypted()
+        );
+    }
+
     struct Offline;
     #[async_trait]
     impl TransportFactory for Offline {
@@ -82,7 +134,8 @@ mod tests {
         assert!(erased.downcast_ref::<ClientDownloadError>().is_some());
 
         let params =
-            DownloadParams::encrypted("/d", &[1; 32], &[2; 32], &[3; 32], 16, MediaType::Image);
+            DownloadParams::encrypted("/d", &[1; 32], &[2; 32], &[3; 32], 16, MediaType::Image)
+                .unwrap();
         let error: ClientDownloadError = client.download(&params).await.unwrap_err();
         assert!(matches!(
             error,
@@ -128,6 +181,38 @@ mod tests {
                 status_code: 200,
                 body: Box::new(Cursor::new(b"external destination".to_vec())),
             })
+        }
+    }
+
+    #[tokio::test]
+    async fn plaintext_params_download_verified_bytes_and_rewind_the_writer() {
+        let data = b"external destination";
+        let hash = wacore::upload::encrypt_media(data, MediaType::Image)
+            .unwrap()
+            .file_sha256;
+        for streaming in [false, true] {
+            let downloader = MediaDownloader::new(
+                Arc::new(AcceptedBody(streaming)),
+                Arc::new(TokioRuntime),
+                MediaRoute::new(vec![whatsapp_rust::download::MediaHost::new(
+                    "cdn.example.com",
+                )]),
+            );
+            for kind in [
+                MediaType::Image,
+                MediaType::NewsletterMusicArtwork,
+                MediaType::ProductCatalogImage,
+            ] {
+                let params =
+                    DownloadParams::plaintext("/file", &hash, data.len() as u64, kind).unwrap();
+                assert_eq!(downloader.download(&params).await.unwrap(), data);
+                let writer = downloader
+                    .download_to_writer(&params, Cursor::new(vec![0xff; 128]))
+                    .await
+                    .unwrap();
+                assert_eq!(writer.position(), 0);
+                assert_eq!(writer.into_inner(), data);
+            }
         }
     }
 
@@ -219,7 +304,8 @@ mod tests {
     async fn download_params_use_canonical_entries_with_final_session_errors() {
         let client = client().await;
         let params =
-            DownloadParams::encrypted("/d", &[1; 32], &[2; 32], &[3; 32], 16, MediaType::Image);
+            DownloadParams::encrypted("/d", &[1; 32], &[2; 32], &[3; 32], 16, MediaType::Image)
+                .unwrap();
         assert!(matches!(
             client.download(&params).await.unwrap_err(),
             ClientDownloadError::MediaSession { .. }
