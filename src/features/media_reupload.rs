@@ -4,6 +4,7 @@
 //! WAWebRequestMediaReuploadManager, WA Web 2.3000.1045368834.
 
 use crate::client::{Client, ClientError, NodeFilter};
+use crate::request::RejectionStanza;
 use futures::FutureExt;
 use futures::future::{Shared, WeakShared};
 use std::sync::{Arc, Weak};
@@ -20,9 +21,19 @@ use wacore_binary::Jid;
 const MEDIA_RETRY_TIMEOUT: Duration = Duration::from_secs(30);
 const MEDIA_REUPLOAD_CONCURRENCY: usize = 32;
 
+/// The bounded phase in which a reupload stopped making progress.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum MediaReuploadPhase {
+    /// Sending the receipt and waiting for its correlated ACK share one budget.
+    SendAndAck,
+    /// Waiting for the mediaretry notification after the receipt was accepted.
+    Notification,
+}
+
 /// Failure of a media reupload. Shared operations preserve the original cause
 /// for every subscriber, including transport and parsing failures.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 #[non_exhaustive]
 pub enum MediaReuploadError {
     Client(Arc<ClientError>),
@@ -30,9 +41,18 @@ pub enum MediaReuploadError {
     NotLoggedIn,
     /// Another target or media key already owns this wire ID.
     Conflict(MessageId),
-    AckTimeout,
-    Rejected(String),
-    Timeout,
+    Timeout {
+        phase: MediaReuploadPhase,
+    },
+    /// The waiter channel closed. Dropping the caller's future produces no error.
+    Cancelled {
+        phase: MediaReuploadPhase,
+    },
+    /// A rejected receipt. Unknown or missing codes remain in the full response.
+    Rejected {
+        code: Option<u16>,
+        response: RejectionStanza,
+    },
     Internal(Arc<anyhow::Error>),
 }
 
@@ -42,10 +62,32 @@ impl std::fmt::Display for MediaReuploadError {
             Self::Client(error) => std::fmt::Display::fmt(error, f),
             Self::NotLoggedIn => f.write_str("local LID is unavailable"),
             Self::Conflict(id) => write!(f, "conflicting media reupload for message {id}"),
-            Self::AckTimeout => f.write_str("media retry receipt ACK timed out"),
-            Self::Rejected(reason) => write!(f, "media retry receipt rejected: {reason}"),
-            Self::Timeout => f.write_str("media retry notification timed out"),
+            Self::Timeout { phase } => write!(f, "media retry {phase:?} timed out"),
+            Self::Cancelled { phase } => write!(f, "media retry {phase:?} waiter cancelled"),
+            Self::Rejected { code, .. } => {
+                write!(f, "media retry receipt rejected (code: {code:?})")
+            }
             Self::Internal(error) => std::fmt::Display::fmt(error, f),
+        }
+    }
+}
+
+impl std::fmt::Debug for MediaReuploadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            // Opaque causes may include keys or signed URLs. Keep them available
+            // through source(), but never format them implicitly in diagnostics.
+            Self::Client(_) => f.write_str("Client([REDACTED])"),
+            Self::Internal(_) => f.write_str("Internal([REDACTED])"),
+            Self::NotLoggedIn => f.write_str("NotLoggedIn"),
+            Self::Conflict(id) => f.debug_tuple("Conflict").field(id).finish(),
+            Self::Timeout { phase } => f.debug_struct("Timeout").field("phase", phase).finish(),
+            Self::Cancelled { phase } => f.debug_struct("Cancelled").field("phase", phase).finish(),
+            Self::Rejected { code, response } => f
+                .debug_struct("Rejected")
+                .field("code", code)
+                .field("response", response)
+                .finish(),
         }
     }
 }
@@ -267,49 +309,92 @@ impl<'a> MediaReupload<'a> {
         // send/ACK remains buffered, but cannot hide a rejected receipt.
         timeout(&*self.client.runtime, MEDIA_RETRY_TIMEOUT, async {
             self.client.send_node(receipt).await?;
-            let ack = ack
-                .await
-                .map_err(|_| anyhow::anyhow!("media retry ACK waiter cancelled"))?;
-            let ack = ack.get();
-            if let Some(error) = ack.get_attr("error") {
-                return Err(MediaReuploadError::Rejected(error.as_str().into_owned()));
+            let ack = ack.await.map_err(|_| MediaReuploadError::Cancelled {
+                phase: MediaReuploadPhase::SendAndAck,
+            })?;
+            if let Some(error) = ack.get().get_attr("error") {
+                return Err(MediaReuploadError::Rejected {
+                    code: error.as_str().parse().ok(),
+                    response: ack.into(),
+                });
             }
-            if let Some(error) = ack.get_optional_child_by_tag(&["error"]) {
-                return Err(MediaReuploadError::Rejected(
-                    error
+            if let Some(error) = ack.get().get_optional_child_by_tag(&["error"]) {
+                return Err(MediaReuploadError::Rejected {
+                    code: error
                         .get_attr("code")
-                        .map(|code| code.as_str().into_owned())
-                        .unwrap_or_else(|| "unspecified server error".into()),
-                ));
+                        .and_then(|code| code.as_str().parse().ok()),
+                    response: ack.into(),
+                });
             }
             Ok(())
         })
         .await
-        .map_err(|_| MediaReuploadError::AckTimeout)??;
+        .map_err(|_| MediaReuploadError::Timeout {
+            phase: MediaReuploadPhase::SendAndAck,
+        })??;
         let node = timeout(&*self.client.runtime, MEDIA_RETRY_TIMEOUT, notification)
             .await
-            .map_err(|_| MediaReuploadError::Timeout)?
-            .map_err(|_| anyhow::anyhow!("media retry notification waiter cancelled"))?;
+            .map_err(|_| MediaReuploadError::Timeout {
+                phase: MediaReuploadPhase::Notification,
+            })?
+            .map_err(|_| MediaReuploadError::Cancelled {
+                phase: MediaReuploadPhase::Notification,
+            })?;
         Ok(parse_media_retry_notification(node.get(), &req.media_key)?)
     }
 
     /// Recover a batch, preserving input order and cardinality. Identical inputs
     /// share one receipt even when separated by more than the concurrency window.
     /// The first occurrence reserves each wire ID; conflicting inputs receive
-    /// `Conflict` in their own result slot.
+    /// `Conflict` in their own result slot. Up to 32 distinct operations run at
+    /// once; duplicates share a slot and completed operations release it
+    /// without waiting for earlier inputs.
     pub async fn request_many(
         &self,
         reqs: &[MediaReuploadRequest<'_>],
     ) -> Vec<Result<MediaRetryResult, MediaReuploadError>> {
         use futures::StreamExt;
-        // Subscribe to all entries before polling any: duplicates beyond the
-        // concurrency window must share even if the first operation finishes.
-        let subscriptions: Vec<_> = reqs.iter().map(|req| self.subscribe(req)).collect();
-        futures::stream::iter(subscriptions)
-            .map(|subscription| async move { subscription?.await })
-            .buffered(MEDIA_REUPLOAD_CONCURRENCY)
+        let mut results = vec![None; reqs.len()];
+        let mut operations: Vec<(Shared<ReuploadFuture>, Vec<usize>)> = Vec::new();
+        let mut by_id = std::collections::HashMap::<&str, usize>::new();
+        // Reserve every input before polling: duplicates beyond the window
+        // must share even if the first operation finishes immediately.
+        for (index, req) in reqs.iter().enumerate() {
+            match self.subscribe(req) {
+                Err(error) => results[index] = Some(Err(error)),
+                Ok(subscription) => {
+                    if let Some(&operation) = by_id.get(req.target.id().as_str())
+                        && operations[operation].0.ptr_eq(&subscription)
+                    {
+                        operations[operation].1.push(index);
+                    } else {
+                        // An external subscriber can complete an operation
+                        // during reservation. Only group the same shared future.
+                        by_id.insert(req.target.id().as_str(), operations.len());
+                        operations.push((subscription, vec![index]));
+                    }
+                }
+            }
+        }
+        async fn complete(
+            (operation, indices): (Shared<ReuploadFuture>, Vec<usize>),
+        ) -> (Result<MediaRetryResult, MediaReuploadError>, Vec<usize>) {
+            (operation.await, indices)
+        }
+        // Collect before awaiting: retaining the map in the stream prevents
+        // MSRV callers from proving this future is Send.
+        let operations: Vec<_> = operations.into_iter().map(complete).collect();
+        let mut pending =
+            futures::stream::iter(operations).buffer_unordered(MEDIA_REUPLOAD_CONCURRENCY);
+        while let Some((result, indices)) = pending.next().await {
+            for index in indices {
+                results[index] = Some(result.clone());
+            }
+        }
+        results
+            .into_iter()
+            .map(|result| result.expect("each reserved input has an operation or conflict"))
             .collect()
-            .await
     }
 }
 

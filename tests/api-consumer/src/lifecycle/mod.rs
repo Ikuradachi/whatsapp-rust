@@ -57,3 +57,42 @@ fn reupload_request_debug_redacts_the_media_key() {
     assert!(debug.contains("REDACTED"));
     assert!(!debug.contains("231"));
 }
+
+/// Both bounded waits expose the same phase type to native and browser callers.
+pub fn recovery_phase(
+    error: &whatsapp_rust::MediaReuploadError,
+) -> Option<whatsapp_rust::MediaReuploadPhase> {
+    use whatsapp_rust::{MediaReuploadError, MediaReuploadPhase};
+    match error {
+        MediaReuploadError::Timeout { phase } | MediaReuploadError::Cancelled { phase } => {
+            match phase {
+                MediaReuploadPhase::SendAndAck | MediaReuploadPhase::Notification => Some(*phase),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+pub fn rejected_receipt(
+    error: &whatsapp_rust::MediaReuploadError,
+) -> Option<(Option<u16>, &whatsapp_rust::RejectionStanza)> {
+    if let whatsapp_rust::MediaReuploadError::Rejected { code, response } = error {
+        // Unknown wire fields remain available without formatting the payload.
+        let _raw_code = response.get().get_attr("error");
+        Some((*code, response))
+    } else {
+        None
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn sendable_batch_recovery<'a>(
+    client: &'a whatsapp_rust::Client,
+    requests: &'a [whatsapp_rust::MediaReuploadRequest<'a>],
+) -> impl std::future::Future<
+    Output = Vec<Result<whatsapp_rust::MediaRetryResult, whatsapp_rust::MediaReuploadError>>,
+> + Send
++ 'a {
+    async move { client.media_reupload().request_many(requests).await }
+}
