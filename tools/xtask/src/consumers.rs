@@ -142,6 +142,24 @@ impl ExpectedFailure {
     }
 }
 
+pub(crate) fn verify_mutation(
+    output: &std::process::Output,
+    code: &str,
+    needle: &str,
+    source: &str,
+) -> Result<()> {
+    ExpectedFailure {
+        error_code: code.into(),
+        contains: vec![needle.into()],
+        source: Some(source.into()),
+    }
+    .verify(
+        output.status.success(),
+        &String::from_utf8_lossy(&output.stdout),
+    )
+    .with_context(|| String::from_utf8_lossy(&output.stderr).into_owned())
+}
+
 fn manifest_key(path: &Path) -> Result<String> {
     Ok(path
         .components()
@@ -380,6 +398,11 @@ pub fn run(root: &Path, task: Task) -> Result<u8> {
                 .args(&args)
                 .current_dir(root)
                 .env("CARGO_BUILD_JOBS", "1")
+                // Many independent profiles compile the generated protocol crate.
+                // Debug symbols and incremental state dwarf these contract tests.
+                .env("CARGO_INCREMENTAL", "0")
+                .env("CARGO_PROFILE_DEV_DEBUG", "0")
+                .env("CARGO_PROFILE_TEST_DEBUG", "0")
                 .env("CARGO_TARGET_DIR", root.join("target/consumers"))
                 // Do not leak host nightly flags into the MSRV or WASM hosts.
                 .env_remove("CARGO_ENCODED_RUSTFLAGS")
