@@ -422,16 +422,20 @@ impl Client {
         guard: &crate::lid_pn_cache::LidPnMutationGuard<'_>,
     ) -> BatchRecordOutcome {
         let cap = mappings.len();
-        let mut deduped: std::collections::HashMap<String, String> =
-            std::collections::HashMap::with_capacity(cap);
-        for (lid, phone_number) in mappings {
-            deduped.insert(phone_number, lid);
+        let mut deduped = std::collections::HashMap::with_capacity(cap);
+        for (position, (lid, phone_number)) in mappings.into_iter().enumerate() {
+            deduped.insert(phone_number, (position, lid));
         }
+        // Retain the existing last-LID-per-phone policy, but apply retained
+        // observations in their input order. Other must never choose a LID's
+        // first PN through randomized HashMap iteration.
+        let mut deduped: Vec<_> = deduped.into_iter().collect();
+        deduped.sort_unstable_by_key(|(_, (position, _))| *position);
 
         let mut entries: Vec<LidPnEntry> = Vec::with_capacity(deduped.len());
         let mut migration_flags: Vec<bool> = Vec::with_capacity(deduped.len());
         let mut usync_phones: Vec<String> = Vec::new();
-        for (phone_number, lid) in deduped {
+        for (phone_number, (_, lid)) in deduped {
             match self
                 .record_lid_pn_in_memory_guarded(&lid, &phone_number, source, guard)
                 .await
@@ -1146,9 +1150,9 @@ impl Client {
     /// (`Ok(None)`) from "lookup failed" (`Err(_)`).
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.session.get_lid_pn_entry", level = "trace", skip_all, fields(peer = %jid.observe()), err(Debug)))]
     pub async fn get_lid_pn_entry(&self, jid: &Jid) -> Result<Option<LidPnEntry>> {
-        let is_lid = if jid.is_lid() {
+        let is_lid = if jid.server.is_lid_family() {
             true
-        } else if jid.is_pn() {
+        } else if jid.server.is_pn_family() {
             false
         } else {
             return Ok(None);
@@ -1358,6 +1362,39 @@ mod tests {
     use wacore::store::in_memory::InMemoryBackend;
     use wacore::store::traits::SignalStore;
     use wacore_binary::Server;
+
+    #[tokio::test]
+    async fn lid_pn_batch_preserves_observation_order_after_phone_deduplication() {
+        let client = create_test_client().await;
+        let mappings: Vec<_> = (1..=32)
+            .map(|n| (format!("100000{n:03}"), format!("1202555{n:04}")))
+            .collect();
+        let outcome = client
+            .record_lid_pn_batch_in_memory(mappings.clone(), LearningSource::Other)
+            .await;
+        let observed: Vec<_> = outcome
+            .entries
+            .iter()
+            .map(|e| (e.lid.to_string(), e.phone_number.to_string()))
+            .collect();
+        assert_eq!(observed, mappings);
+    }
+
+    #[tokio::test]
+    async fn lid_pn_batch_does_not_replace_the_first_observation_of_a_lid() {
+        let client = create_test_client().await;
+        let outcome = client
+            .record_lid_pn_batch_in_memory(
+                vec![
+                    ("100000001".into(), "12025550111".into()),
+                    ("100000001".into(), "12025550112".into()),
+                ],
+                LearningSource::Other,
+            )
+            .await;
+        assert_eq!(outcome.entries[0].phone_number.as_ref(), "12025550111");
+        assert_eq!(outcome.usync_phones, ["12025550112"]);
+    }
 
     /// Fixture: test client with one cached peer LID-PN mapping.
     async fn client_with_peer_mapping() -> (Arc<Client>, &'static str, &'static str) {
