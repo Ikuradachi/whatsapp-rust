@@ -1238,7 +1238,33 @@ impl GroupMetadataGuard<'_> {
             .await;
     }
 
+    pub(crate) async fn rotate_sender_key_on_participant_remove(
+        &self,
+        users: &[&str],
+    ) -> anyhow::Result<()> {
+        self.client
+            .rotate_sender_key_on_participant_remove_locked(self.jid, users)
+            .await
+    }
+
+    pub(crate) async fn force_rotate_own_sender_key(&self) -> anyhow::Result<()> {
+        self.client
+            .force_rotate_own_sender_key_locked(self.jid)
+            .await
+    }
+
     pub(crate) async fn publish(&self, info: Arc<GroupRoutingInfo>) {
+        self.publish_scoped(info, None).await;
+    }
+
+    pub(crate) async fn publish_scoped(
+        &self,
+        info: Arc<GroupRoutingInfo>,
+        scope: Option<crate::client::NotificationScope<'_>>,
+    ) {
+        if scope.is_some_and(|scope| !scope.is_current(self.client)) {
+            return;
+        }
         let jid = self.jid.to_string();
         match serde_json::to_vec(info.as_ref()) {
             Ok(blob) => {
@@ -1260,6 +1286,8 @@ impl GroupMetadataGuard<'_> {
             }
         }
 
+        // Once storage starts, finish cache publication under the same lock.
+        // Retirement cannot undo a storage commit.
         self.cache(info).await;
     }
 
@@ -1271,6 +1299,16 @@ impl GroupMetadataGuard<'_> {
     /// longer has — and the persisted delete is an `await` on storage, which is
     /// exactly the pause that would let one through.
     pub(crate) async fn invalidate(&self) {
+        self.invalidate_scoped(None).await;
+    }
+
+    pub(crate) async fn invalidate_scoped(
+        &self,
+        scope: Option<crate::client::NotificationScope<'_>>,
+    ) {
+        if scope.is_some_and(|scope| !scope.is_current(self.client)) {
+            return;
+        }
         self.client.get_group_cache().invalidate(self.jid).await;
         if let Err(error) = self
             .client

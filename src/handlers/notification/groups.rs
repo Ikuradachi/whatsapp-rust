@@ -141,7 +141,14 @@ async fn run_server_sync_collections(
     feature = "tracing",
     tracing::instrument(name = "wa.notif.group", level = "debug", skip_all)
 )]
-pub(crate) async fn handle_group_notification(client: &Arc<Client>, node: Arc<OwnedNodeRef>) {
+pub(crate) async fn handle_group_notification(
+    client: &Arc<Client>,
+    node: Arc<OwnedNodeRef>,
+    scope: crate::client::NotificationScope<'_>,
+) -> bool {
+    if !scope.is_current(client) {
+        return false;
+    }
     // `<groups_dirty>` is the one `w:gp2` stanza the server sends about itself:
     // `from` is `s.whatsapp.net`, not a group. Parsing it as an ordinary group
     // notification would name the server as the group in every event it
@@ -152,14 +159,14 @@ pub(crate) async fn handle_group_notification(client: &Arc<Client>, node: Arc<Ow
             .core
             .event_bus
             .dispatch(Event::Notification(Arc::clone(&node)));
-        return;
+        return true;
     }
 
     let mut notification = match GroupNotification::try_from_node_ref(node.get()) {
         Some(n) => n,
         None => {
             warn!(target: "Client/Group", "w:gp2 notification missing 'from' attribute");
-            return;
+            return true;
         }
     };
 
@@ -172,20 +179,31 @@ pub(crate) async fn handle_group_notification(client: &Arc<Client>, node: Arc<Ow
     let action_count = actions.len();
 
     for (action_index, action) in actions.into_iter().enumerate() {
+        if !scope.is_current(client) {
+            return false;
+        }
         // Granularly patch group cache instead of invalidating — matches WA Web's
         // addParticipantInfo / removeParticipantInfo pattern and avoids a
         // group metadata IQ round-trip.
         match &action {
             GroupNotificationAction::Add { participants, .. } => {
-                let metadata = client.lock_group_metadata(&notification.group_jid).await;
-                if let Some(info) = metadata.current().await {
+                let Some(metadata) = scope
+                    .run(client, client.lock_group_metadata(&notification.group_jid))
+                    .await
+                else {
+                    return false;
+                };
+                let Some(current) = scope.run(client, metadata.current()).await else {
+                    return false;
+                };
+                if let Some(info) = current {
                     let mut info = Arc::unwrap_or_clone(info);
                     info.add_participants(
                         participants
                             .iter()
                             .map(|p| (&p.jid, p.phone_number.as_ref())),
                     );
-                    metadata.publish(Arc::new(info)).await;
+                    metadata.publish_scoped(Arc::new(info), Some(scope)).await;
                     debug!(
                         target: "Client/Group",
                         "Patched group cache for {}: added {} participants",
@@ -198,13 +216,24 @@ pub(crate) async fn handle_group_notification(client: &Arc<Client>, node: Arc<Ow
                         "Group cache expired for {}: invalidating persisted metadata (add)",
                         notification.group_jid.observe()
                     );
-                    metadata.invalidate().await;
+                    metadata.invalidate_scoped(Some(scope)).await;
                 }
             }
             GroupNotificationAction::Remove { participants, .. } => {
                 let users: Vec<&str> = participants.iter().map(|p| p.jid.user.as_str()).collect();
-                let metadata = client.lock_group_metadata(&notification.group_jid).await;
-                if let Some(info) = metadata.current().await {
+                let Some(metadata) = scope
+                    .run(client, client.lock_group_metadata(&notification.group_jid))
+                    .await
+                else {
+                    return false;
+                };
+                let Some(current) = scope.run(client, metadata.current()).await else {
+                    return false;
+                };
+                if !scope.is_current(client) {
+                    return false;
+                }
+                if let Some(info) = current {
                     let mut info = Arc::unwrap_or_clone(info);
                     info.remove_participants(&users);
                     metadata.publish(Arc::new(info)).await;
@@ -222,10 +251,13 @@ pub(crate) async fn handle_group_notification(client: &Arc<Client>, node: Arc<Ow
                     );
                     metadata.invalidate().await;
                 }
-                drop(metadata);
-                client
-                    .rotate_sender_key_on_participant_remove(&notification.group_jid, &users)
-                    .await;
+                if let Err(error) = metadata
+                    .rotate_sender_key_on_participant_remove(&users)
+                    .await
+                {
+                    warn!(target: "Client/Group", "Sender-key retirement failed; ACK withheld: {error}");
+                    return false;
+                }
             }
             GroupNotificationAction::Modify { .. } => {
                 // A participant changed number / migrated PN<->LID. WA Web
@@ -242,16 +274,27 @@ pub(crate) async fn handle_group_notification(client: &Arc<Client>, node: Arc<Ow
                     "Group modify (number/LID migration) for {}: invalidating metadata and rotating sender key",
                     notification.group_jid.observe()
                 );
-                let metadata = client.lock_group_metadata(&notification.group_jid).await;
+                let Some(metadata) = scope
+                    .run(client, client.lock_group_metadata(&notification.group_jid))
+                    .await
+                else {
+                    return false;
+                };
+                if !scope.is_current(client) {
+                    return false;
+                }
                 metadata.invalidate().await;
-                drop(metadata);
-                client
-                    .force_rotate_own_sender_key(&notification.group_jid)
-                    .await;
+                if let Err(error) = metadata.force_rotate_own_sender_key().await {
+                    warn!(target: "Client/Group", "Sender-key retirement failed; ACK withheld: {error}");
+                    return false;
+                }
             }
             _ => {}
         }
 
+        if !scope.is_current(client) {
+            return false;
+        }
         debug!(
             target: "Client/Group",
             "Group notification: group={}, action={}",
@@ -304,10 +347,14 @@ pub(crate) async fn handle_group_notification(client: &Arc<Client>, node: Arc<Ow
     }
 
     // Also dispatch legacy generic notification for backward compatibility
+    if !scope.is_current(client) {
+        return false;
+    }
     client
         .core
         .event_bus
         .dispatch(Event::Notification(Arc::clone(&node)));
+    true
 }
 
 /// The server named these groups' cached metadata stale.

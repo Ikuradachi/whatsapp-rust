@@ -29,22 +29,79 @@ impl StanzaHandler for NotificationHandler {
         &self,
         client: Arc<Client>,
         node: Arc<OwnedNodeRef>,
-        _cancelled: &mut bool,
+        cancelled: &mut bool,
     ) -> bool {
+        let generation = client
+            .connection_generation
+            .load(std::sync::atomic::Ordering::Acquire);
         let shutdown = client.connection_shutdown_signal();
-        Self::handle_scoped(&client, node, &shutdown).await;
+        if shutdown.is_fired()
+            || Self::capture_group(&client, &node, &shutdown, generation)
+                .await
+                .is_err()
+        {
+            *cancelled = true;
+            return true;
+        }
+        *cancelled |= !Self::handle_scoped(&client, node, &shutdown, generation).await;
         true
     }
 }
 
 impl NotificationHandler {
+    /// The node dispatcher calls this before interceptors; direct router
+    /// callers enter through `handle` instead. Neither path captures twice.
+    pub(crate) async fn capture_group(
+        client: &Client,
+        node: &Arc<OwnedNodeRef>,
+        shutdown: &wacore::runtime::ShutdownSignal,
+        generation: u64,
+    ) -> Result<Option<u64>, ()> {
+        let Some(hook) = client.group_notification_durability_hook.get() else {
+            return Ok(None);
+        };
+        if node.get().attrs().optional_string("type").as_deref()
+            != Some(NotificationType::WGp2.as_str())
+        {
+            return Ok(None);
+        }
+        let scope = crate::client::NotificationScope::new(generation, shutdown);
+        let Some(result) = scope
+            .run(client, hook.on_notification(Arc::clone(node)))
+            .await
+        else {
+            return Err(());
+        };
+        if result.is_err() {
+            log::warn!("Group notification capture failed; ACK withheld");
+            return Err(());
+        }
+        // Capture can outlive the socket that received this envelope. Its
+        // durable record remains useful, but old effects must not mutate the
+        // replacement connection or ACK its notification queue.
+        if shutdown.is_fired()
+            || client
+                .connection_generation
+                .load(std::sync::atomic::Ordering::Acquire)
+                != generation
+        {
+            debug!(
+                "Group notification capture completed on a retired connection; effects withheld"
+            );
+            return Err(());
+        }
+        Ok(Some(generation))
+    }
     pub(crate) async fn handle_scoped(
         client: &Arc<Client>,
         node: Arc<OwnedNodeRef>,
         shutdown: &wacore::runtime::ShutdownSignal,
-    ) {
-        if !shutdown.is_fired() {
-            handle_notification_scoped(client, node, shutdown).await;
+        generation: u64,
+    ) -> bool {
+        if shutdown.is_fired() {
+            false
+        } else {
+            handle_notification_scoped(client, node, shutdown, generation).await
         }
     }
 }
@@ -52,15 +109,23 @@ impl NotificationHandler {
 #[cfg(test)]
 async fn handle_notification_impl(client: &Arc<Client>, node: Arc<OwnedNodeRef>) {
     let shutdown = client.connection_shutdown_signal();
-    handle_notification_scoped(client, node, &shutdown).await;
+    handle_notification_scoped(
+        client,
+        node,
+        &shutdown,
+        client
+            .connection_generation
+            .load(std::sync::atomic::Ordering::Acquire),
+    )
+    .await;
 }
 
 /// Dispatch notification by type.
 ///
 /// Every asynchronous arm is `Box::pin`ned. Awaiting a plain async fn inlines
-/// its state machine into this one, and `async_trait` boxes *this* future on
-/// every inbound `<notification>` — so without the indirection that one
-/// allocation is sized for the union of all the arms, and a
+/// its state machine into this one, retained by both the node dispatcher and
+/// the boxed router handler. Without the indirection their futures carry the
+/// union of all the arms, and a
 /// `<notification type="picture">` pays for `handle_devices_notification`'s
 /// locals. Measured on `benches/inbound_stanza`, a `<notification
 /// type="picture">` allocated 2306 bytes before — of which a single 2272-byte
@@ -76,7 +141,8 @@ async fn handle_notification_scoped(
     client: &Arc<Client>,
     node: Arc<OwnedNodeRef>,
     shutdown: &wacore::runtime::ShutdownSignal,
-) {
+    generation: u64,
+) -> bool {
     let nr = node.get();
     let notification_type = nr.attrs().optional_string("type");
 
@@ -112,7 +178,8 @@ async fn handle_notification_scoped(
             Box::pin(handle_contacts_notification(client, nr)).await
         }
         Some(NotificationType::WGp2) => {
-            Box::pin(handle_group_notification(client, Arc::clone(&node))).await
+            let scope = crate::client::NotificationScope::new(generation, shutdown);
+            return Box::pin(handle_group_notification(client, Arc::clone(&node), scope)).await;
         }
         Some(NotificationType::DisappearingMode) => {
             handle_disappearing_mode_notification(client, nr)
@@ -137,7 +204,7 @@ async fn handle_notification_scoped(
                 ))
                 .await
             {
-                return;
+                return true;
             }
             let other = notification_type.as_deref().unwrap_or_default();
             debug!("Unhandled notification type '{other}', dispatching raw event");
@@ -147,6 +214,7 @@ async fn handle_notification_scoped(
                 .dispatch(Event::Notification(Arc::clone(&node)));
         }
     }
+    true
 }
 
 mod companion_reg;
@@ -163,6 +231,8 @@ use groups::*;
 use privacy_business::*;
 use profile::*;
 
+#[cfg(test)]
+mod durability_tests;
 #[cfg(test)]
 mod reachout_tests;
 

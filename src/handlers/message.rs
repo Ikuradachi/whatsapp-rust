@@ -1,5 +1,5 @@
 use super::traits::StanzaHandler;
-use crate::client::{ChatLane, Client, QueuedChatMessage};
+use crate::client::{ChatLane, Client, NotificationScope, QueuedChatMessage};
 use async_trait::async_trait;
 use log::warn;
 use std::sync::Arc;
@@ -31,14 +31,23 @@ const LANE_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60
 pub(crate) struct MessageHandler;
 
 impl MessageHandler {
-    #[cfg_attr(
-        feature = "tracing",
-        tracing::instrument(name = "wa.recv.message_enqueue", level = "debug", skip_all)
-    )]
     pub(crate) async fn handle_inline(
         client: Arc<Client>,
         node: Arc<wacore_binary::OwnedNodeRef>,
         cancelled: &mut bool,
+    ) -> bool {
+        Self::handle_inline_scoped(client, node, cancelled, None).await
+    }
+
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(name = "wa.recv.message_enqueue", level = "debug", skip_all)
+    )]
+    pub(crate) async fn handle_inline_scoped(
+        client: Arc<Client>,
+        node: Arc<wacore_binary::OwnedNodeRef>,
+        cancelled: &mut bool,
+        scope: Option<NotificationScope<'_>>,
     ) -> bool {
         let chat_jid = match node.attrs().optional_jid("from") {
             // Normalize AD metadata so the same chat always maps to one lane
@@ -67,7 +76,20 @@ impl MessageHandler {
         // below included (see `create_chat_lane` for why it outlives the lane).
         let _guard = lane.enqueue_lock.lock().await;
 
-        let node = match lane.try_enqueue(node) {
+        // A lane lookup or enqueue lock can resume after reconnection. Do not
+        // admit an old notification to a worker created by the new connection.
+        if scope.is_some_and(|scope| !scope.is_current(&client)) {
+            *cancelled = true;
+            return true;
+        }
+
+        let node = match lane.try_enqueue_scoped(
+            node,
+            scope.map_or_else(
+                wacore::runtime::ShutdownSignal::never,
+                NotificationScope::shutdown,
+            ),
+        ) {
             Ok(()) => return true,
             // The worker went idle and closed its queue (see
             // `LANE_IDLE_TIMEOUT`). Replace the lane; the successor worker
@@ -101,7 +123,17 @@ impl MessageHandler {
                     .await
             }
         };
-        if let Err(e) = fresh.try_enqueue(node) {
+        if scope.is_some_and(|scope| !scope.is_current(&client)) {
+            *cancelled = true;
+            return true;
+        }
+        if let Err(e) = fresh.try_enqueue_scoped(
+            node,
+            scope.map_or_else(
+                wacore::runtime::ShutdownSignal::never,
+                NotificationScope::shutdown,
+            ),
+        ) {
             warn!("Failed to enqueue message for processing: {e}");
             *cancelled = true;
         }
@@ -210,6 +242,7 @@ fn create_chat_lane(
 async fn process_queued(
     client: &Arc<Client>,
     QueuedChatMessage {
+        shutdown,
         node: msg_node,
         lane_liveness, // Prevents capacity eviction until processing finishes.
     }: QueuedChatMessage,
@@ -227,12 +260,18 @@ async fn process_queued(
     // backlog would stop reporting the single pathological message
     // this guard exists to catch.
     let start = wacore::time::Instant::now();
-    // Awaited inline (not boxed): the future lives in this
-    // once-per-chat worker task instead of a fresh ~9 KB heap box
-    // per message, which dominated per-message allocation churn.
-    Arc::clone(client)
-        .handle_incoming_message_scoped(msg_node, spawn_generation)
-        .await;
+    if msg_node.tag() == StanzaTag::Notification.as_str() {
+        client
+            .process_queued_group_notification(msg_node, spawn_generation, shutdown)
+            .await;
+    } else {
+        // Awaited inline (not boxed): the future lives in this
+        // once-per-chat worker task instead of a fresh ~9 KB heap box
+        // per message, which dominated per-message allocation churn.
+        Arc::clone(client)
+            .handle_incoming_message_scoped(msg_node, spawn_generation)
+            .await;
+    }
     let elapsed = start.elapsed();
     if elapsed.as_millis() as u64 > MAX_MESSAGE_DELAY_MS {
         warn!(
@@ -395,11 +434,11 @@ mod tests {
         }
     }
 
-    // Exact and width independent: the entry must stay two handles.
+    // Exact and width independent: the entry carries the enqueue-time shutdown handle.
     // Rebaseline per [layout asserts](../../agent_docs/testing.md).
     #[test]
-    fn queued_chat_message_keeps_two_handles() {
-        assert_eq!(size_of::<QueuedChatMessage>(), 2 * size_of::<usize>());
+    fn queued_chat_message_keeps_three_handles() {
+        assert_eq!(size_of::<QueuedChatMessage>(), 3 * size_of::<usize>());
     }
 
     #[cfg(feature = "bench-harness")]
@@ -488,6 +527,7 @@ mod tests {
 
         // 2. process_queued future
         let queued = QueuedChatMessage {
+            shutdown: wacore::runtime::ShutdownSignal::never(),
             node: Arc::clone(&dummy_node),
             lane_liveness: Arc::new(async_lock::Mutex::new(())),
         };
@@ -701,5 +741,70 @@ mod tests {
         assert_eq!(harness.active_lanes(), 256);
         harness.close_lanes();
         assert_eq!(harness.active_lanes(), 0);
+    }
+    #[tokio::test]
+    async fn slow_group_capture_reports_lane_delay() {
+        use crate::test_utils::log_capture;
+        use portable_atomic::AtomicU64;
+        use std::sync::atomic::Ordering;
+        const TEST: &str = "handlers::message::tests::slow_group_capture_reports_lane_delay";
+        if log_capture::delegated_to_child(TEST) {
+            return;
+        }
+        struct Clock(Arc<AtomicU64>);
+        impl wacore::time::MonotonicProvider for Clock {
+            fn now_nanos(&self) -> u64 {
+                self.0.load(Ordering::Acquire)
+            }
+        }
+        struct SlowCapture(Arc<AtomicU64>);
+        #[async_trait::async_trait]
+        impl crate::GroupNotificationDurabilityHook for SlowCapture {
+            async fn on_notification(
+                &self,
+                _: Arc<wacore_binary::OwnedNodeRef>,
+            ) -> anyhow::Result<()> {
+                self.0
+                    .fetch_add((MAX_MESSAGE_DELAY_MS + 1) * 1_000_000, Ordering::AcqRel);
+                anyhow::bail!("synthetic capture failure after a long wait");
+            }
+        }
+        let clock = Arc::new(AtomicU64::new(0));
+        wacore::time::set_monotonic_provider(Clock(clock.clone())).unwrap();
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        assert!(
+            client
+                .group_notification_durability_hook
+                .set(Arc::new(SlowCapture(clock)))
+                .is_ok()
+        );
+        let node = node_to_owned_ref(
+            &NodeBuilder::new("notification")
+                .attr("type", "w:gp2")
+                .attr("from", "120363000000000000@g.us")
+                .attr("id", "slow-capture")
+                .build(),
+        );
+        let logs = log_capture::session();
+        let generation = client.connection_generation.load(Ordering::Acquire);
+        assert!(
+            process_queued(
+                &client,
+                QueuedChatMessage {
+                    node,
+                    shutdown: client.connection_shutdown_signal(),
+                    lane_liveness: Arc::new(async_lock::Mutex::new(())),
+                },
+                generation
+            )
+            .await
+        );
+        assert!(
+            logs.records_for("MessageQueue")
+                .iter()
+                .any(|(level, message)| *level == log::Level::Warn
+                    && message.contains("Message processing took"))
+        );
+        assert!(transport.sent().is_empty());
     }
 }

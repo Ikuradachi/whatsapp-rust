@@ -3803,6 +3803,8 @@ fn client_size_pins_runtime_cache_config_saving() {
         expected += size_of::<Arc<bench_startup::StartupTasks>>();
     }
     expected += size_of::<std::sync::OnceLock<Arc<dyn crate::HistorySyncCaptureHook>>>();
+    // Independent group capture adds one immutable hook cell; keep the fixed base.
+    expected += size_of::<std::sync::OnceLock<Arc<dyn crate::GroupNotificationDurabilityHook>>>();
     // The detached storage owner now also owns the reusable arena, replacing
     // its former inline async mutex. Account for the actual attachment rather
     // than raising the fixed Client base; retention includes test-only gates.
