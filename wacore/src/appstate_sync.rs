@@ -313,6 +313,10 @@ struct RecoveryRequest {
     /// Set once an answer carrying this id has been taken up, so a repeat of
     /// that answer is refused before it costs a decode.
     answering: bool,
+    /// The caller's monotonic connection generation when the ask was made.
+    /// It distinguishes retired replies and prevents an older sender from
+    /// replacing a newer request, since the marker survives a reconnect.
+    generation: u64,
 }
 
 /// What became of a collection the primary sent back.
@@ -484,14 +488,47 @@ impl AppStateProcessor {
     /// `false` means one is already outstanding and the caller should not send:
     /// the reply that is already coming answers this ask too.
     pub async fn mark_recovery_requested(&self, collection: &str) -> bool {
+        self.mark_recovery_requested_on_generation(collection, 0)
+            .await
+    }
+
+    /// Records the caller's connection generation for response validation.
+    pub async fn mark_recovery_requested_on_generation(
+        &self,
+        collection: &str,
+        generation: u64,
+    ) -> bool {
+        self.mark_recovery_request(collection, generation, None)
+            .await
+    }
+
+    /// Records the id and generation atomically before a peer send.
+    pub async fn mark_recovery_requested_with_id(
+        &self,
+        collection: &str,
+        generation: u64,
+        request_id: &str,
+    ) -> bool {
+        self.mark_recovery_request(collection, generation, Some(request_id))
+            .await
+    }
+
+    async fn mark_recovery_request(
+        &self,
+        collection: &str,
+        generation: u64,
+        request_id: Option<&str>,
+    ) -> bool {
         let mut outstanding = self.recovery_requested.lock().await;
         if let Some(request) = outstanding.get(collection)
-            && request.asked_at.elapsed()
-                < if request.answering {
-                    Self::RECOVERY_ANSWER_TTL
-                } else {
-                    Self::RECOVERY_REQUEST_TTL
-                }
+            && (request.generation > generation
+                || (request.generation == generation
+                    && request.asked_at.elapsed()
+                        < if request.answering {
+                            Self::RECOVERY_ANSWER_TTL
+                        } else {
+                            Self::RECOVERY_REQUEST_TTL
+                        }))
         {
             return false;
         }
@@ -499,8 +536,9 @@ impl AppStateProcessor {
             collection.to_string(),
             RecoveryRequest {
                 asked_at: crate::time::Instant::now(),
-                request_id: None,
+                request_id: request_id.map(str::to_string),
                 answering: false,
+                generation,
             },
         );
         true
@@ -536,6 +574,16 @@ impl AppStateProcessor {
     /// against the same request. `None` once it is claimed, and every path that
     /// ends an answer removes the request outright.
     pub async fn claim_recovery_request_by_id(&self, request_id: &str) -> Option<String> {
+        self.claim_recovery_request_with_generation_by_id(request_id)
+            .await
+            .map(|(name, _)| name)
+    }
+
+    /// Claims a reply together with its request generation, before decoding.
+    pub async fn claim_recovery_request_with_generation_by_id(
+        &self,
+        request_id: &str,
+    ) -> Option<(String, u64)> {
         let mut outstanding = self.recovery_requested.lock().await;
         let (name, request) = outstanding
             .iter_mut()
@@ -548,7 +596,7 @@ impl AppStateProcessor {
         // handler rather than recording an unanswered ask -- and a reply can
         // arrive long after the ask's own window closed.
         request.asked_at = crate::time::Instant::now();
-        Some(name.clone())
+        Some((name.clone(), request.generation))
     }
 
     /// Takes the request an id answers, whatever its payload turned out to be.
@@ -558,13 +606,24 @@ impl AppStateProcessor {
     /// marker would suppress every retry for the rest of the window over an ask
     /// that has already been answered -- badly, but answered.
     pub async fn take_recovery_request_by_id(&self, request_id: &str) -> Option<String> {
+        self.take_recovery_request_with_generation_by_id(request_id)
+            .await
+            .map(|(collection, _)| collection)
+    }
+
+    /// [`Self::take_recovery_request_by_id`], also returning the generation the
+    /// ask was marked with.
+    pub async fn take_recovery_request_with_generation_by_id(
+        &self,
+        request_id: &str,
+    ) -> Option<(String, u64)> {
         let mut outstanding = self.recovery_requested.lock().await;
         let collection = outstanding
             .iter()
             .find(|(_, request)| request.request_id.as_deref() == Some(request_id))
             .map(|(name, _)| name.clone())?;
-        outstanding.remove(&collection);
-        Some(collection)
+        let request = outstanding.remove(&collection)?;
+        Some((collection, request.generation))
     }
 
     /// Whether a recovery for this collection is outstanding, without taking it.

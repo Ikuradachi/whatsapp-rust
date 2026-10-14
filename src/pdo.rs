@@ -807,34 +807,74 @@ impl Client {
         // id, and a reply that beats the send's return would otherwise find the
         // request recorded with no id at all -- unrecognisable, and so unable to
         // free the ask it answers.
-        let request_id = self.generate_message_id_at(wacore::time::now_secs_u64());
-
         let proc = self.get_app_state_processor();
-        if !proc.mark_recovery_requested(collection).await {
-            // One is already outstanding, and the reply that is coming answers
-            // this ask too. Suppressing the duplicate is also what keeps the
-            // marker honest: a second send that failed would otherwise withdraw
-            // the first request's only record of itself.
-            debug!("A recovery for {collection} is already outstanding; not asking again");
-            return Ok(String::new());
-        }
-        proc.note_recovery_request_id(collection, &request_id).await;
-        match self
-            .send_peer_message_with_id(peer_target, &msg, &request_id)
+        // Retry one reconnect, with a fresh id and marker. Repeated connection
+        // churn is left to the app-state retry loop rather than an unbounded send.
+        for _ in 0..2 {
+            let reachable = wacore::runtime::timeout(
+                &*self.runtime,
+                std::time::Duration::from_secs(60),
+                self.wait_until_reachable(),
+            )
             .await
-        {
-            Ok(()) => Ok(request_id),
-            Err(e) => {
-                // By id, not by name. The window this marker holds is shorter
-                // than a send can take, so by now another ask for the same
-                // collection may have replaced this entry -- and withdrawing by
-                // name would take *its* marker, leaving a request that really is
-                // on the wire with nothing to recognise its answer. Taking by id
-                // withdraws this ask or nothing.
-                proc.take_recovery_request_by_id(&request_id).await;
-                Err(e)
+            .map_err(|_| {
+                anyhow::anyhow!("timed out waiting for an authenticated recovery connection")
+            })?;
+            if reachable != crate::client::Reachability::Reachable {
+                anyhow::bail!("snapshot recovery connection is {reachable:?}");
             }
+            let generation = self
+                .connection_generation
+                .load(std::sync::atomic::Ordering::Acquire);
+            let socket = self.get_noise_socket()?;
+            let request_id = self.generate_message_id_at(wacore::time::now_secs_u64());
+            if !proc
+                .mark_recovery_requested_with_id(collection, generation, &request_id)
+                .await
+            {
+                if self
+                    .connection_generation
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    != generation
+                {
+                    continue;
+                }
+                debug!("A recovery for {collection} is already outstanding; not asking again");
+                return Ok(String::new());
+            }
+            let result = self
+                .send_message_impl(
+                    peer_target.clone(),
+                    &msg,
+                    crate::send::SendPipelineOptions {
+                        request_id: Some(&request_id),
+                        peer: true,
+                        send_scope: Some((generation, socket)),
+                        ..Default::default()
+                    },
+                )
+                .await;
+            if self
+                .connection_generation
+                .load(std::sync::atomic::Ordering::Acquire)
+                != generation
+                || !self.can_reach_server()
+            {
+                proc.take_recovery_request_by_id(&request_id).await;
+                continue;
+            }
+            return match result {
+                Ok(_) => Ok(request_id),
+                Err(e) => {
+                    // A replacement request must never lose its marker.
+                    proc.take_recovery_request_by_id(&request_id).await;
+                    Err(e)
+                }
+            };
         }
+        Err(anyhow::anyhow!(
+            "connection changed twice while sending snapshot recovery"
+        ))
     }
 
     /// Sends a peer message (message to our own devices).
@@ -1017,14 +1057,26 @@ impl Client {
         // about itself -- and with two recoveries outstanding, a reply carrying
         // A's id and B's name would select B's marker and be checked against its
         // own name, which always agrees. So the ask decides.
-        let Some(asked) = self
+        let Some((asked, generation)) = self
             .get_app_state_processor()
-            .claim_recovery_request_by_id(request_id)
+            .claim_recovery_request_with_generation_by_id(request_id)
             .await
         else {
             warn!("Ignoring a snapshot recovery nothing here asked for");
             return;
         };
+
+        if self
+            .connection_generation
+            .load(std::sync::atomic::Ordering::Acquire)
+            != generation
+        {
+            self.get_app_state_processor()
+                .take_recovery_request_by_id(request_id)
+                .await;
+            debug!("Dropping retired recovery for {asked} before decoding");
+            return;
+        }
 
         // The whole continuation is detached, not just the CPU inside it.
         // `receive.rs` awaits this handler inline and inbound processing is
@@ -1070,67 +1122,13 @@ impl Client {
         }
         let payload = blob.to_vec();
         let request_id = request_id.to_string();
-        let generation = self
-            .connection_generation
-            .load(std::sync::atomic::Ordering::Acquire);
 
         self.runtime.spawn_detached(Box::pin(async move {
             // Up to 64 MiB of inflate plus a decode wide enough that `waproto`
             // pins its instantiation: off the runtime's async workers either
             // way.
             let decoded = wacore::runtime::blocking(&*client.runtime, move || {
-                let bytes = if compressed {
-                    let mut reader = wacore_binary::zlib_pool::InflateReader::new(
-                        &payload,
-                        wacore::history_sync::MAX_DECOMPRESSED,
-                    );
-                    let mut plain = Vec::new();
-                    loop {
-                        match reader.ensure(1) {
-                            Ok(true) => {}
-                            // `ensure(1)` answers false only with nothing left.
-                            Ok(false) => break,
-                            Err(e) => return Err(format!("failed to decompress: {e}")),
-                        }
-                        let taken = {
-                            let chunk = reader.available();
-                            plain.extend_from_slice(chunk);
-                            chunk.len()
-                        };
-                        if taken == 0 {
-                            break;
-                        }
-                        reader.consume(taken);
-                    }
-                    // Running out is not ending. A payload cut short after a
-                    // parseable prefix would otherwise be applied as the whole
-                    // collection, and a short collection cannot be told from a
-                    // real one -- nothing here knows how many records to expect.
-                    if !reader.stream_ended() {
-                        return Err("is a truncated compressed stream".to_string());
-                    }
-                    // And ending is not all of it. A complete stream followed by
-                    // a second member or by trailing bytes leaves the reader
-                    // done with input to spare, and taking the first member for
-                    // the collection is the same silent short read the check
-                    // above refuses -- reached from the other direction.
-                    let (read, whole) = reader.compressed_progress();
-                    if read != whole {
-                        return Err(format!(
-                            "carries {} byte(s) after its compressed stream",
-                            whole - read
-                        ));
-                    }
-                    std::borrow::Cow::Owned(plain)
-                } else {
-                    // Already bounded: the raw blob was measured against the
-                    // same ceiling before it was copied, which is what an
-                    // uncompressed reply needs -- the decode allocates a record
-                    // graph from whatever arrives.
-                    std::borrow::Cow::Borrowed(&payload[..])
-                };
-                waproto::codec::syncd_snapshot_recovery_decode(&bytes)
-                    .map_err(|e| format!("failed to decode: {e}"))
+                decode_snapshot_recovery(&payload, compressed)
             })
             .await;
 
@@ -2713,6 +2711,223 @@ mod tests {
             (client, transport, info)
         }
 
+        fn authenticate_recovery_fixture(client: &Arc<Client>) {
+            client
+                .is_logged_in
+                .store(true, std::sync::atomic::Ordering::Release);
+            client.authenticated_generation.store(
+                client
+                    .connection_generation
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                std::sync::atomic::Ordering::SeqCst,
+            );
+            client.session_state_notifier.notify(usize::MAX);
+        }
+
+        #[tokio::test]
+        async fn recovery_retry_waits_for_the_final_authenticated_generation() {
+            let (client, _, _) = manual_retry_client().await;
+            let generation = client
+                .connection_generation
+                .load(std::sync::atomic::Ordering::Acquire);
+            client
+                .is_logged_in
+                .store(true, std::sync::atomic::Ordering::Release);
+            client
+                .authenticated_generation
+                .store(generation, std::sync::atomic::Ordering::SeqCst);
+            let peer: Jid = "12025550100@s.whatsapp.net".parse().unwrap();
+            let mutex = client
+                .session_lock_for(peer.to_protocol_address().as_str())
+                .await;
+            let held = mutex.lock().await;
+            let proc = client.get_app_state_processor();
+            let sender = Arc::clone(&client);
+            let job =
+                tokio::spawn(
+                    async move { sender.request_syncd_snapshot_recovery("regular_low").await },
+                );
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while !proc.has_recovery_request("regular_low").await {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            // Teardown increments first; connect publishes a socket; success
+            // authenticates and increments again only after the parked send resumes.
+            client
+                .connection_generation
+                .store(generation + 1, std::sync::atomic::Ordering::SeqCst);
+            client
+                .is_logged_in
+                .store(false, std::sync::atomic::Ordering::Release);
+            let replacement = Arc::new(crate::transport::mock::CapturingMockTransport::new());
+            install_socket(&client, replacement.clone());
+            let prior_listeners = client.session_state_notifier.total_listeners();
+            drop(held);
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while !job.is_finished()
+                    && client.session_state_notifier.total_listeners() <= prior_listeners
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(
+                replacement.sent().is_empty(),
+                "an intermediate pre-login generation must send no recovery"
+            );
+            assert!(!job.is_finished(), "retry must await authentication");
+            client
+                .connection_generation
+                .store(generation + 2, std::sync::atomic::Ordering::SeqCst);
+            client
+                .authenticated_generation
+                .store(generation + 2, std::sync::atomic::Ordering::SeqCst);
+            client
+                .is_logged_in
+                .store(true, std::sync::atomic::Ordering::Release);
+            client.session_state_notifier.notify(usize::MAX);
+            let id = tokio::time::timeout(std::time::Duration::from_secs(5), job)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(replacement.sent().len(), 1);
+            assert_eq!(
+                proc.take_recovery_request_with_generation_by_id(&id).await,
+                Some(("regular_low".into(), generation + 2))
+            );
+        }
+
+        #[tokio::test]
+        async fn recovery_send_stops_after_two_reconnects_and_releases_markers() {
+            let (client, _, _) = manual_retry_client().await;
+            authenticate_recovery_fixture(&client);
+            let (first_entered, first_release) = failure_socket(&client);
+            let sender = Arc::clone(&client);
+            let job =
+                tokio::spawn(
+                    async move { sender.request_syncd_snapshot_recovery("regular_low").await },
+                );
+            tokio::time::timeout(std::time::Duration::from_secs(5), first_entered.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let (second_entered, second_release) = failure_socket(&client);
+            client
+                .connection_generation
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            authenticate_recovery_fixture(&client);
+            first_release.send(()).await.unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(5), second_entered.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            client
+                .connection_generation
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            authenticate_recovery_fixture(&client);
+            second_release.send(()).await.unwrap();
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_secs(5), job)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .is_err()
+            );
+            assert!(
+                !client
+                    .get_app_state_processor()
+                    .has_recovery_request("regular_low")
+                    .await
+            );
+        }
+
+        #[tokio::test]
+        async fn retired_recovery_reply_is_released_before_decode_is_scheduled() {
+            let (client, _, _) = manual_retry_client().await;
+            let proc = client.get_app_state_processor();
+            let generation = client
+                .connection_generation
+                .load(std::sync::atomic::Ordering::Acquire);
+            assert!(
+                proc.mark_recovery_requested_with_id("regular_low", generation, "retired")
+                    .await
+            );
+            client
+                .connection_generation
+                .store(generation + 1, std::sync::atomic::Ordering::Release);
+            let mut response = wa::message::peer_data_operation_request_response_message::peer_data_operation_result::SyncDSnapshotFatalRecoveryResponse::default();
+            response.collection_snapshot = Some(vec![255; 32]);
+            response.is_compressed = Some(true);
+            client
+                .handle_syncd_snapshot_recovery_response(&response, "retired")
+                .await;
+            assert!(
+                !proc.has_recovery_request("regular_low").await,
+                "retired reply is consumed synchronously, before a decode job can run"
+            );
+            assert!(
+                proc.mark_recovery_requested_with_id("regular_low", generation + 1, "replacement")
+                    .await
+            );
+        }
+
+        #[tokio::test]
+        async fn recovery_send_retries_on_reconnect_without_using_old_marker() {
+            let (client, old_transport, _) = manual_retry_client().await;
+            authenticate_recovery_fixture(&client);
+            let peer: Jid = "12025550100@s.whatsapp.net".parse().unwrap();
+            let mutex = client
+                .session_lock_for(peer.to_protocol_address().as_str())
+                .await;
+            let held = mutex.lock().await;
+            let proc = client.get_app_state_processor();
+            let generation = client
+                .connection_generation
+                .load(std::sync::atomic::Ordering::Acquire);
+            let sender = Arc::clone(&client);
+            let job =
+                tokio::spawn(
+                    async move { sender.request_syncd_snapshot_recovery("regular_low").await },
+                );
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while !proc.has_recovery_request("regular_low").await {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let replacement = Arc::new(crate::transport::mock::CapturingMockTransport::new());
+            install_socket(&client, replacement.clone());
+            client
+                .connection_generation
+                .store(generation + 1, std::sync::atomic::Ordering::Release);
+            authenticate_recovery_fixture(&client);
+            drop(held);
+            let id = tokio::time::timeout(std::time::Duration::from_secs(5), job)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert!(
+                old_transport.sent().is_empty(),
+                "retired send must not hit the old socket"
+            );
+            assert_eq!(
+                replacement.sent().len(),
+                1,
+                "only the freshly marked request goes out"
+            );
+            assert_eq!(
+                proc.take_recovery_request_with_generation_by_id(&id).await,
+                Some(("regular_low".to_string(), generation + 1))
+            );
+        }
+
         #[tokio::test]
         async fn outgoing_lid_pdo_uses_recipient_alias_and_preserves_metadata() {
             use wacore::types::events::ChannelEventHandler;
@@ -4103,5 +4318,194 @@ mod tests {
             client.pdo_requested.get(&gate_key).await.is_some(),
             "memo must survive a content-less response"
         );
+    }
+}
+
+/// Decode the complete bounded recovery before allowing any state changes.
+fn decode_snapshot_recovery(
+    payload: &[u8],
+    compressed: bool,
+) -> Result<wa::SyncdSnapshotRecovery, String> {
+    let bytes = if compressed {
+        match inflate_zlib(payload) {
+            Ok(plain) => std::borrow::Cow::Owned(plain),
+            Err(zlib) => match inflate_gzip(payload) {
+                Some(plain) => std::borrow::Cow::Owned(plain),
+                None => return Err(format!("{zlib}; not a complete gzip stream either")),
+            },
+        }
+    } else {
+        std::borrow::Cow::Borrowed(payload)
+    };
+    waproto::codec::syncd_snapshot_recovery_decode(&bytes)
+        .map_err(|e| format!("failed to decode: {e}"))
+}
+/// Inflates a zlib stream, refusing one that is cut short or followed by more
+/// bytes.
+fn inflate_zlib(payload: &[u8]) -> Result<Vec<u8>, String> {
+    let mut reader = wacore_binary::zlib_pool::InflateReader::new(
+        payload,
+        wacore::history_sync::MAX_DECOMPRESSED,
+    );
+    let mut plain = Vec::new();
+    loop {
+        match reader.ensure(1) {
+            Ok(true) => {}
+            // `ensure(1)` answers false only with nothing left.
+            Ok(false) => break,
+            Err(e) => return Err(format!("failed to decompress: {e}")),
+        }
+        let taken = {
+            let chunk = reader.available();
+            plain.extend_from_slice(chunk);
+            chunk.len()
+        };
+        if taken == 0 {
+            break;
+        }
+        reader.consume(taken);
+    }
+    // Running out is not ending. A payload cut short after a
+    // parseable prefix would otherwise be applied as the whole
+    // collection, and a short collection cannot be told from a
+    // real one -- nothing here knows how many records to expect.
+    if !reader.stream_ended() {
+        return Err("is a truncated compressed stream".to_string());
+    }
+    // And ending is not all of it. A complete stream followed by
+    // a second member or by trailing bytes leaves the reader
+    // done with input to spare, and taking the first member for
+    // the collection is the same silent short read the check
+    // above refuses -- reached from the other direction.
+    let (read, whole) = reader.compressed_progress();
+    if read != whole {
+        return Err(format!(
+            "carries {} byte(s) after its compressed stream",
+            whole - read
+        ));
+    }
+    Ok(plain)
+}
+
+/// The primary's reply flagged compressed but sent as gzip (`1f 8b 08 00`),
+/// not zlib. Bounded like the zlib path, and whole or nothing like it too.
+fn inflate_gzip(payload: &[u8]) -> Option<Vec<u8>> {
+    inflate_gzip_bounded(payload, wacore::history_sync::MAX_DECOMPRESSED)
+}
+
+fn inflate_gzip_bounded(payload: &[u8], max: u64) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let mut decoder = flate2::bufread::GzDecoder::new(payload);
+    let mut plain = Vec::new();
+    (&mut decoder).take(max + 1).read_to_end(&mut plain).ok()?;
+    if plain.is_empty() || plain.len() as u64 > max {
+        return None;
+    }
+    // The reader stops after the first member, so a stream that ends before
+    // the payload does would hand a parseable prefix over as the whole
+    // collection. It reads from the slice itself, and what it leaves of it has
+    // to be nothing.
+    if !decoder.into_inner().is_empty() {
+        return None;
+    }
+    info!(
+        "Snapshot recovery payload is gzip, not zlib (header {:02x?})",
+        &payload[..payload.len().min(4)]
+    );
+    Some(plain)
+}
+
+#[cfg(test)]
+#[allow(clippy::disallowed_methods)] // Synthetic protobuf fixtures, as permitted by clippy.toml.
+mod inflate_gzip_tests {
+    use super::inflate_gzip;
+    use std::io::Write;
+
+    fn gzip(data: &[u8]) -> Vec<u8> {
+        let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        e.write_all(data).unwrap();
+        e.finish().unwrap()
+    }
+
+    fn recovery() -> super::wa::SyncdSnapshotRecovery {
+        let mut recovery = super::wa::SyncdSnapshotRecovery::default();
+        recovery.collection_name = Some("regular_low".to_string());
+        let mut version = super::wa::SyncdVersion::default();
+        version.version = Some(7);
+        recovery.version = buffa::MessageField::some(version);
+        recovery
+    }
+
+    #[test]
+    fn decodes_compressed_recovery_as_gzip_and_zlib() {
+        use buffa::Message;
+        let expected = recovery();
+        let raw = expected.encode_to_vec();
+        let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        z.write_all(&raw).unwrap();
+        for payload in [gzip(&raw), z.finish().unwrap()] {
+            let decoded = super::decode_snapshot_recovery(&payload, true).unwrap();
+            assert_eq!(decoded, expected);
+        }
+        assert_eq!(
+            super::decode_snapshot_recovery(&raw, false).unwrap(),
+            expected
+        );
+        assert!(super::decode_snapshot_recovery(&gzip(&raw), false).is_err());
+    }
+
+    #[test]
+    fn decoder_rejects_incomplete_or_appended_recoveries() {
+        use buffa::Message;
+        let raw = recovery().encode_to_vec();
+        let payload = gzip(&raw);
+        assert!(super::decode_snapshot_recovery(&payload[..payload.len() - 4], true).is_err());
+        let mut members = payload.clone();
+        members.extend(gzip(&raw));
+        assert!(super::decode_snapshot_recovery(&members, true).is_err());
+        let mut corrupt = payload;
+        let n = corrupt.len();
+        corrupt[n - 8] ^= 1;
+        assert!(super::decode_snapshot_recovery(&corrupt, true).is_err());
+        assert!(super::decode_snapshot_recovery(&gzip(&[255]), true).is_err());
+    }
+
+    #[test]
+    fn inflates_a_whole_gzip_stream() {
+        assert_eq!(
+            inflate_gzip(&gzip(b"records")).as_deref(),
+            Some(&b"records"[..])
+        );
+    }
+
+    #[test]
+    fn gzip_limit_accepts_the_boundary_and_rejects_one_byte_more() {
+        assert_eq!(
+            super::inflate_gzip_bounded(&gzip(b"12345678"), 8),
+            Some(b"12345678".to_vec())
+        );
+        assert_eq!(super::inflate_gzip_bounded(&gzip(b"123456789"), 8), None);
+    }
+
+    #[test]
+    fn refuses_a_second_member() {
+        let mut payload = gzip(b"first half");
+        payload.extend(gzip(b"second half"));
+        assert_eq!(inflate_gzip(&payload), None);
+    }
+
+    #[test]
+    fn refuses_trailing_bytes() {
+        let mut payload = gzip(b"records");
+        payload.push(0);
+        assert_eq!(inflate_gzip(&payload), None);
+    }
+
+    #[test]
+    fn refuses_a_truncated_stream() {
+        let data: Vec<u8> = (0..4096u32).flat_map(|i| i.to_le_bytes()).collect();
+        let payload = gzip(&data);
+        assert_eq!(inflate_gzip(&payload[..payload.len() - 4]), None);
+        assert_eq!(inflate_gzip(&payload[..payload.len() / 2]), None);
     }
 }

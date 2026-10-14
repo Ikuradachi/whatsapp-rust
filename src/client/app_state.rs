@@ -3402,6 +3402,12 @@ impl Client {
         generation: u64,
         recovery: waproto::whatsapp::SyncdSnapshotRecovery,
     ) {
+        if self.connection_generation.load(Ordering::Acquire) != generation {
+            self.get_app_state_processor()
+                .take_recovery_request_by_id(request_id)
+                .await;
+            return;
+        }
         // `WAPatchName::from_str` is infallible: every unrecognised name maps to
         // `Unknown`, which is one shared reservation slot and one collection
         // this side has no rules for. Rejecting it explicitly is the difference
@@ -3524,11 +3530,15 @@ impl Client {
         // expired and been replaced. Taking by name would consume the
         // replacement's marker, apply the older reply, and have the newer one
         // refused as unsolicited.
-        if proc.take_recovery_request_by_id(request_id).await.is_none() {
-            debug!(
-                target: "Client/AppState",
-                "The recovery request for {name} is no longer outstanding; dropping this reply"
-            );
+        let Some((_, asked_on)) = proc
+            .take_recovery_request_with_generation_by_id(request_id)
+            .await
+        else {
+            debug!(target: "Client/AppState", "The recovery request for {name} is no longer outstanding; dropping this reply");
+            return;
+        };
+        if asked_on != generation {
+            debug!(target: "Client/AppState", "Dropping the {name} recovery from a retired request generation");
             return;
         }
 
@@ -3555,7 +3565,7 @@ impl Client {
         // held across the awaits inside the apply, and `Client` carries trait
         // objects that are neither on wasm.
         let live = Arc::clone(&self.connection_generation);
-        let still_current = move || live.load(Ordering::Acquire) == generation;
+        let still_current = move || live.load(Ordering::Acquire) == asked_on;
         // The recovery's own version, read before `apply_snapshot_recovery`
         // moves `recovery`: it is the post-apply cursor for the semantic
         // context below. `apply_snapshot_recovery` refuses a version-less
@@ -4745,6 +4755,61 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn recovery_from_retired_request_generation_does_not_advance_state() {
+        let client = crate::test_utils::create_test_client_with_name("retired-recovery").await;
+        client
+            .persistence_manager
+            .backend()
+            .set_version(
+                "regular_low",
+                wacore::appstate::hash::HashState {
+                    version: 7,
+                    bootstrapped: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let generation = client.connection_generation.load(Ordering::Acquire);
+        let proc = client.get_app_state_processor();
+        assert!(
+            proc.mark_recovery_requested_on_generation("regular_low", generation)
+                .await
+        );
+        proc.note_recovery_request_id("regular_low", "old-request")
+            .await;
+        client
+            .connection_generation
+            .store(generation + 1, Ordering::Release);
+        let mut recovery = wa::SyncdSnapshotRecovery::default();
+        recovery.collection_name = Some("regular_low".to_string());
+        let mut version = wa::SyncdVersion::default();
+        version.version = Some(8);
+        recovery.version = buffa::MessageField::some(version);
+        recovery.collection_lthash = Some(vec![0; 128]);
+        client
+            .apply_recovered_collection("regular_low", "old-request", generation + 1, recovery)
+            .await;
+        assert_eq!(
+            client
+                .persistence_manager
+                .backend()
+                .get_version("regular_low")
+                .await
+                .unwrap()
+                .unwrap()
+                .version,
+            7
+        );
+        assert!(!proc.has_recovery_request("regular_low").await);
+        assert!(
+            proc.mark_recovery_requested_on_generation("regular_low", generation + 1)
+                .await,
+            "retired answer does not suppress retries"
+        );
+    }
 
     /// JID redaction keeps routing answerable without leaking accounts:
     /// a value that parses as a JID with a known server redacts to
