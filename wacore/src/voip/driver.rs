@@ -557,11 +557,21 @@ fn queue_transmit(
     dropped
 }
 
-fn pop_next_packet(queue: &mut VecDeque<SendBatch>) -> Option<(Bytes, SendBatchKind)> {
-    let index = queue
-        .iter()
-        .position(|batch| batch.kind == SendBatchKind::Control)
-        .unwrap_or(0);
+/// The next packet to hand the transport, if one may go now.
+///
+/// Control first, then the rest of the call's media, then video, and video only while
+/// `video_ready`. The pacer holds video back so an access unit leaves at the pacing rate rather
+/// than all at once, and nothing else may wait behind it: an audio frame is due every 20 to 60 ms,
+/// and behind a paced keyframe it would be held for a few hundred. Audio and video travel on
+/// their own SSRCs, so letting one pass the other reorders nothing either receiver tracks.
+fn pop_next_packet(
+    queue: &mut VecDeque<SendBatch>,
+    video_ready: bool,
+) -> Option<(Bytes, SendBatchKind)> {
+    let first = |kind| queue.iter().position(|batch| batch.kind == kind);
+    let index = first(SendBatchKind::Control)
+        .or_else(|| first(SendBatchKind::Media))
+        .or_else(|| video_ready.then(|| first(SendBatchKind::Video)).flatten())?;
     let batch = queue.get_mut(index)?;
     batch.started = true;
     let kind = batch.kind;
@@ -571,6 +581,78 @@ fn pop_next_packet(queue: &mut VecDeque<SendBatch>) -> Option<(Bytes, SendBatchK
         queue.remove(index);
     }
     Some((packet, kind))
+}
+
+/// How far above the measured video rate the pacer runs. A margin, not a limit on the encoder: the
+/// pacer only spreads what it is given, and 2.5 is the factor WebRTC's paced sender uses, which
+/// drains a keyframe several times its frame interval long in a few frame intervals.
+const VIDEO_PACE_FACTOR: (u64, u64) = (5, 2);
+/// The pace before the call has a rate to go by, and the least it ever runs at, so the first
+/// keyframe of a call, the largest unit it sends, is not held back by the rate of no video at all.
+const VIDEO_PACE_FLOOR_BPS: u64 = 1_000_000;
+/// The window the video rate is measured over.
+const VIDEO_PACE_WINDOW_MS: engine::Millis = 1_000;
+/// How much may leave together. The drive loop's timers count whole milliseconds, so a packet may
+/// go up to this early rather than the pace collapsing to one packet per timer tick; a few
+/// milliseconds of the pacing rate is two or three packets, not a burst.
+const VIDEO_PACE_BURST_US: u64 = 5_000;
+
+/// Spreads outbound video over time, so an access unit reaches the relay at the pacing rate rather
+/// than as one burst of every packet it was cut into.
+///
+/// A keyframe is several times the size of the frames around it, and the engine packetizes it in
+/// one call: sent back to back, its forty or more packets leave at whatever rate the host can
+/// write them, which the relay's flow (or the path behind it) can take only as loss. WhatsApp's
+/// own engine paces its video the same way (its paced sender, with a pacing rate and a pacing
+/// factor, sits between the encoder and the transport). Losing part of a keyframe costs the peer
+/// its picture until the next one arrives, which is the freeze a peer sees.
+///
+/// The pace follows the rate the call's video has actually been sent at, so it needs nothing from
+/// the application: a smaller picture paces slower, a larger one faster.
+#[derive(Default)]
+struct VideoPacer {
+    /// Video packets sent within the last window, as (when, bytes).
+    sent: VecDeque<(engine::Millis, usize)>,
+    sent_bytes: usize,
+    /// When the next video packet may leave, in microseconds of the drive clock.
+    next_us: u64,
+}
+
+impl VideoPacer {
+    /// Whether a video packet may leave at `now`.
+    fn ready(&self, now: engine::Millis) -> bool {
+        now.saturating_mul(1000).saturating_add(VIDEO_PACE_BURST_US) >= self.next_us
+    }
+
+    /// The first millisecond at which [`Self::ready`] holds.
+    fn ready_at(&self) -> engine::Millis {
+        self.next_us
+            .saturating_sub(VIDEO_PACE_BURST_US)
+            .div_ceil(1000)
+    }
+
+    fn rate_bps(&self) -> u64 {
+        let measured = (self.sent_bytes as u64).saturating_mul(8 * 1000) / VIDEO_PACE_WINDOW_MS;
+        (measured.saturating_mul(VIDEO_PACE_FACTOR.0) / VIDEO_PACE_FACTOR.1)
+            .max(VIDEO_PACE_FLOOR_BPS)
+    }
+
+    /// A video packet of `bytes` left at `now`: the next may follow once it has, at the pace.
+    fn sent(&mut self, now: engine::Millis, bytes: usize) {
+        while let Some(&(at, old)) = self.sent.front()
+            && now.saturating_sub(at) >= VIDEO_PACE_WINDOW_MS
+        {
+            self.sent.pop_front();
+            self.sent_bytes = self.sent_bytes.saturating_sub(old);
+        }
+        self.sent.push_back((now, bytes));
+        self.sent_bytes = self.sent_bytes.saturating_add(bytes);
+        // An idle pacer starts from now, not from where it last stopped: time with nothing to send
+        // is not a credit to spend on a burst.
+        let start = self.next_us.max(now.saturating_mul(1000));
+        let spacing = (bytes as u64).saturating_mul(8 * 1_000_000) / self.rate_bps();
+        self.next_us = start.saturating_add(spacing);
+    }
 }
 
 /// Drive one call to completion: returns when the relay channel disconnects, a send fails, or the
@@ -691,6 +773,11 @@ async fn run_call_with_clock_and_wallclock(
 
     let mut timer: DeadlineTimer = Fuse::terminated();
     let mut armed_deadline: Option<engine::Millis> = None;
+    // Outbound video leaves at the pacer's rate; its timer wakes the loop when video is all that
+    // waits and the pacer is not ready for it yet.
+    let mut pacer = VideoPacer::default();
+    let mut pace_timer: DeadlineTimer = Fuse::terminated();
+    let mut armed_pace: Option<engine::Millis> = None;
 
     // Why the drive ends, handed back to the shell so `VoipMediaSession::close` receives the real
     // reason instead of the `Local` default. A plain hangup leaves it `Local`; every break below
@@ -867,14 +954,35 @@ async fn run_call_with_clock_and_wallclock(
 
         // Start the next queued send when none is in flight. The future owns an Arc clone, so it is
         // `'static` (no borrow of the loop's `transport`).
+        let now = now_ms();
         if sending.future.is_terminated()
-            && let Some((data, kind)) = pop_next_packet(&mut send_queue)
+            && let Some((data, kind)) = pop_next_packet(&mut send_queue, pacer.ready(now))
         {
+            if kind == SendBatchKind::Video {
+                pacer.sent(now, data.len());
+            }
             let t = transport.clone();
             let fut: BoxFuture<'static, anyhow::Result<()>> =
                 Box::pin(async move { t.send(data).await });
             sending.future = fut.fuse();
             sending.kind = Some(kind);
+        }
+
+        // Nothing went out although video is queued: the pacer is holding it. Wake when it may go.
+        // A send in flight needs no timer, since its completion wakes the loop anyway.
+        let pace_due = (sending.future.is_terminated()
+            && send_queue
+                .iter()
+                .any(|batch| batch.kind == SendBatchKind::Video))
+        .then(|| pacer.ready_at());
+        if pace_due != armed_pace || (pace_due.is_some() && pace_timer.is_terminated()) {
+            pace_timer = match pace_due {
+                Some(at) => rt
+                    .sleep(Duration::from_millis(at.saturating_sub(now_ms())))
+                    .fuse(),
+                None => Fuse::terminated(),
+            };
+            armed_pace = pace_due;
         }
 
         // Deadlines are absolute, so a sleep already armed for this one still expires at the right
@@ -1328,6 +1436,8 @@ async fn run_call_with_clock_and_wallclock(
                 Err(_) => timed_video_in_open = false,
             },
             _ = &mut timer => eng.handle_input(now_ms(), Input::Timeout),
+            // The pacer let the next video packet go; the top of the loop sends it.
+            () = &mut pace_timer => {},
         }
 
         // Post-select: the arm futures (which borrow the channels) have been dropped, so it is now
@@ -2993,21 +3103,21 @@ mod tests {
     // Video through the real drive loop: Enable + orientation via video_ctl (biased ahead of the
     // media arms), mirrored peer video packets via the relay (reassemble to video_out with the
     // orientation stamped), one of our own AUs via video_in (fans out to PT-97 FU-A transmits).
-    // Deterministic: queues drain by bias order, then the first timer arm closes the relay.
+    // Deterministic: queues drain by bias order on virtual time, which the pacer needs to let the
+    // video out, and the relay closes once a timer fires past the horizon, long after it has.
     #[test]
     fn drive_loop_routes_video_both_ways() {
         use crate::voip::rtp::{RTP_PAYLOAD_TYPE_H264, VIDEO_TS_STRIDE_15FPS, parse_rtp_header};
         use crate::voip::session::{VideoPipeline, VideoPipelineParams};
         use crate::voip::ssrc;
 
-        let sleeps = Arc::new(AtomicUsize::new(0));
         let (relay_tx, relay_rx) = async_channel::unbounded();
-        // The timer arm is only polled once every queue is idle; its first sleep closes the relay,
-        // ending the loop deterministically after all the video work is done.
-        let rt: Arc<dyn Runtime> = Arc::new(CloseRelayOnSleepRuntime {
-            sleeps,
+        let clock = Arc::new(AtomicU64::new(0));
+        let rt: Arc<dyn Runtime> = Arc::new(ScheduleRuntime {
+            clock: clock.clone(),
+            arms: Arc::new(Mutex::new(Vec::new())),
             relay_tx: relay_tx.clone(),
-            close_after: 1,
+            horizon_ms: 5_000,
         });
         let transport = Arc::new(RecordingTransport::default());
         let cfg = config();
@@ -3079,7 +3189,7 @@ mod tests {
         }
 
         let eng = CallEngine::new(cfg, Box::new(SequentialTxIds::new())).unwrap();
-        futures::executor::block_on(run_call(
+        futures::executor::block_on(run_call_with_clock(
             rt,
             transport.clone() as Arc<dyn RelayTransport>,
             relay_rx,
@@ -3098,6 +3208,7 @@ mod tests {
                 media_stats: Arc::new(crate::voip::media_stats::MediaStatsCell::default()),
             },
             eng,
+            move || clock.load(Ordering::Relaxed),
         ));
 
         // RTP frame metadata takes precedence over the signaling fallback.
@@ -3174,6 +3285,112 @@ mod tests {
         );
     }
 
+    /// Drain `queue` the way the drive loop does, one packet whenever the pacer allows, with the
+    /// clock jumping to the pacer's next moment whenever it holds video back. Returns when each
+    /// packet left, by kind.
+    fn drain_paced(
+        queue: &mut VecDeque<SendBatch>,
+        pacer: &mut VideoPacer,
+        mut now: engine::Millis,
+    ) -> Vec<(engine::Millis, SendBatchKind)> {
+        let mut sent = Vec::new();
+        while !queue.is_empty() {
+            match pop_next_packet(queue, pacer.ready(now)) {
+                Some((packet, kind)) => {
+                    if kind == SendBatchKind::Video {
+                        pacer.sent(now, packet.len());
+                    }
+                    sent.push((now, kind));
+                }
+                None => {
+                    let at = pacer.ready_at();
+                    assert!(at > now, "a held packet must be due later, not now");
+                    now = at;
+                }
+            }
+        }
+        sent
+    }
+
+    #[test]
+    fn a_keyframe_leaves_at_the_pacing_rate_rather_than_in_one_burst() {
+        // Forty-five 830-byte packets: a 37 KB keyframe, the size of a 720p one.
+        let packets = (0..45).map(|_| Bytes::from(vec![0x90; 830])).collect();
+        let mut queue = VecDeque::from([SendBatch::video(packets)]);
+        let mut pacer = VideoPacer::default();
+
+        let sent = drain_paced(&mut queue, &mut pacer, 10_000);
+
+        assert_eq!(sent.len(), 45);
+        // Nothing has been sent yet, so the floor sets the pace: 830 bytes every 6.64 ms at 1 Mbit/s,
+        // less the few milliseconds a packet may leave early.
+        let span = sent.last().unwrap().0 - sent[0].0;
+        assert!(
+            (280..=300).contains(&span),
+            "45 packets at 1 Mbit/s take about 300 ms; took {span} ms"
+        );
+        let same_instant = sent.iter().filter(|(at, _)| *at == sent[0].0).count();
+        assert!(
+            same_instant <= 2,
+            "only the burst allowance may leave together; {same_instant} did"
+        );
+    }
+
+    #[test]
+    fn the_pace_follows_the_rate_video_is_sent_at() {
+        let mut pacer = VideoPacer::default();
+        assert_eq!(pacer.rate_bps(), VIDEO_PACE_FLOOR_BPS);
+        // A second of 2 Mbit/s video: 250 kB spread over the window.
+        for ms in 0..1000 {
+            pacer.sent(ms, 250);
+        }
+        assert_eq!(
+            pacer.rate_bps(),
+            5_000_000,
+            "two and a half times the rate sent"
+        );
+        // A quiet second later the measured rate is gone and the floor is back.
+        pacer.sent(2_500, 1);
+        assert_eq!(pacer.rate_bps(), VIDEO_PACE_FLOOR_BPS);
+    }
+
+    #[test]
+    fn an_idle_pacer_saves_no_credit_for_a_burst() {
+        let mut pacer = VideoPacer::default();
+        pacer.sent(0, 830);
+        assert!(!pacer.ready(0), "the next packet waits for the pace");
+        // Ten seconds of silence do not let the next keyframe out all at once.
+        assert!(pacer.ready(10_000));
+        pacer.sent(10_000, 830);
+        pacer.sent(10_000, 830);
+        assert!(!pacer.ready(10_000));
+        assert!(pacer.ready_at() > 10_000);
+    }
+
+    #[test]
+    fn audio_and_control_pass_video_the_pacer_is_holding() {
+        let audio = || SendBatch::packet(Bytes::from_static(&[0x90, 0x01]));
+        let control = || SendBatch::packet(Bytes::from_static(&[0x00, 0x01]));
+        let video = || SendBatch::video(vec![Bytes::from_static(&[0x90, 0x02]); 3]);
+        let mut queue = VecDeque::from([video(), audio(), control()]);
+
+        let (_, kind) = pop_next_packet(&mut queue, false).unwrap();
+        assert_eq!(kind, SendBatchKind::Control);
+        let (_, kind) = pop_next_packet(&mut queue, false).unwrap();
+        assert_eq!(
+            kind,
+            SendBatchKind::Media,
+            "audio does not wait behind paced video"
+        );
+        assert!(
+            pop_next_packet(&mut queue, false).is_none(),
+            "video waits for the pacer"
+        );
+        let (_, kind) = pop_next_packet(&mut queue, true).unwrap();
+        assert_eq!(kind, SendBatchKind::Video);
+        assert!(queue[0].started, "the access unit is now under way");
+    }
+
     #[test]
     fn large_video_au_is_queued_atomically() {
         fn video_packet(seq: u16, marker: bool) -> Bytes {
@@ -3203,7 +3420,7 @@ mod tests {
         assert_eq!(queue[0].kind, SendBatchKind::Video);
         assert_eq!(queue[0].packets.len(), 40);
 
-        let sent: Vec<u16> = std::iter::from_fn(|| pop_next_packet(&mut queue))
+        let sent: Vec<u16> = std::iter::from_fn(|| pop_next_packet(&mut queue, true))
             .map(|(packet, _)| parse_rtp_header(&packet).unwrap().sequence_number)
             .collect();
         assert_eq!(sent, (0..40u16).collect::<Vec<_>>());
@@ -3261,7 +3478,7 @@ mod tests {
         assert_eq!(queue[0].kind, SendBatchKind::Video);
         assert!(queue[0].video_keyframe, "STAP-A-first AU is a keyframe");
         assert_eq!(queue[0].packets.len(), 3);
-        let sent: Vec<u16> = std::iter::from_fn(|| pop_next_packet(&mut queue))
+        let sent: Vec<u16> = std::iter::from_fn(|| pop_next_packet(&mut queue, true))
             .map(|(packet, _)| parse_rtp_header(&packet).unwrap().sequence_number)
             .collect();
         assert_eq!(sent, vec![0, 1, 2]);
