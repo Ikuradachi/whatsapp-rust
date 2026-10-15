@@ -2,6 +2,7 @@
 
 use super::*;
 use smallvec::SmallVec;
+use wacore::telemetry::LiveAdmissionRefusal;
 
 /// Parsed session envelope with explicit retry/ownership semantics.
 ///
@@ -597,6 +598,7 @@ impl Client {
                 .has_owned_for_message(&info)
             && !Box::pin(self.flush_inbound_commits_while_processing()).await
         {
+            wacore::telemetry::live_admission_refused(LiveAdmissionRefusal::RetainedWrite);
             return;
         }
         if self.inbound_durability_hook().is_some()
@@ -616,17 +618,20 @@ impl Client {
             {
                 Ok(producer) => Some(producer),
                 Err(error) => {
+                    wacore::telemetry::live_admission_refused(LiveAdmissionRefusal::Receipts);
                     log::warn!("Receipt admission refused before decrypt: {error:?}");
                     return;
                 }
             };
             if !self.ack_or_replay_to_hook(&info).await {
+                wacore::telemetry::live_admission_refused(LiveAdmissionRefusal::RetainedWrite);
                 return;
             }
             if self.inbound_commit_batch.is_active()
                 && self.inbound_commit_batch.has_entries()
                 && !Box::pin(self.flush_inbound_commits_while_processing()).await
             {
+                wacore::telemetry::live_admission_refused(LiveAdmissionRefusal::RetainedWrite);
                 return;
             }
         }
@@ -634,6 +639,7 @@ impl Client {
         // untouched for server redelivery; reset never evicts a retained live row.
         let _live_admission = if self.inbound_durability_hook().is_some() {
             if let Err(error) = self.persist_live_retained_before_decrypt(&info).await {
+                wacore::telemetry::live_admission_refused(LiveAdmissionRefusal::RetainedWrite);
                 log::warn!(
                     "Retained live write is still unavailable; leaving ciphertext untouched: {error:?}"
                 );
@@ -658,8 +664,12 @@ impl Client {
             if admission.is_err()
                 && self.inbound_commit_batch.is_active()
                 && self.inbound_commit_batch.has_entries()
-                && Box::pin(self.flush_inbound_commits_while_processing()).await
             {
+                if !Box::pin(self.flush_inbound_commits_while_processing()).await {
+                    wacore::telemetry::live_admission_refused(LiveAdmissionRefusal::RetainedWrite);
+                    log::warn!("Live pending batch flush failed before decrypt");
+                    return;
+                }
                 admission = self.inbound_commit_batch.live_retention.reserve_with_info(
                     stanza_origin,
                     wire_bytes,
@@ -670,6 +680,7 @@ impl Client {
             match admission {
                 Ok(admission) => Some(admission),
                 Err(error) => {
+                    wacore::telemetry::live_admission_refused(LiveAdmissionRefusal::Capacity);
                     log::warn!("Live pending capacity exhausted before decrypt: {error:?}");
                     return;
                 }
@@ -686,6 +697,7 @@ impl Client {
             {
                 Ok(producer) => Some(producer),
                 Err(error) => {
+                    wacore::telemetry::live_admission_refused(LiveAdmissionRefusal::Receipts);
                     log::warn!("Receipt admission refused before decrypt: {error:?}");
                     return;
                 }
