@@ -69,3 +69,17 @@ Native plugins use the existing registration and lifecycle hooks. WASM keeps
 plugin dependencies disabled. Do not expand core state for a single plugin or
 claim protocol parity from an application hook. SDK integration guides belong
 in https://github.com/oxidezap/whatsapp-rust-docs.
+
+## Public contract changes
+
+Public modules, re-exports, generated models, macro output and dependency types
+in signatures carry source compatibility obligations, including behind features.
+Use the SDK's dependency re-exports to avoid version mismatches. Do not remove
+public paths or change construction without updating isolated consumers and
+providing a migration.
+
+Runtime, transport, HTTP, storage, durability hooks and neutral media ports remain
+open implementation points. Required trait methods and tighter thread bounds
+break implementers. Add defaults only when absence has an honest, safe meaning;
+never replace atomic persistence with sequential writes or silently accept an
+unsupported capability. Batch overrides inherit the owning method's contracts.
