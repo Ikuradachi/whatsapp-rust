@@ -78,6 +78,13 @@ enum SendBatchKind {
     Control,
     Media,
     Video,
+    VideoRetransmission,
+}
+
+impl SendBatchKind {
+    fn is_video(self) -> bool {
+        matches!(self, Self::Video | Self::VideoRetransmission)
+    }
 }
 
 struct SendBatch {
@@ -118,6 +125,16 @@ impl SendBatch {
             video_keyframe,
         }
     }
+
+    fn retransmit_video(data: Bytes) -> Self {
+        Self {
+            bytes: data.len(),
+            packets: VecDeque::from([data]),
+            kind: SendBatchKind::VideoRetransmission,
+            started: false,
+            video_keyframe: false,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -154,8 +171,8 @@ fn cancel_in_flight_group_media(
     let Some(kind) = sending.kind else {
         return DroppedMedia::default();
     };
-    let cancel = (epoch_advanced && kind != SendBatchKind::Control)
-        || (audio_only && kind == SendBatchKind::Video);
+    let cancel =
+        (epoch_advanced && kind != SendBatchKind::Control) || (audio_only && kind.is_video());
     if !cancel {
         return DroppedMedia::default();
     }
@@ -183,7 +200,7 @@ fn purge_unstarted_video(
 ) -> DroppedMedia {
     let mut dropped = DroppedMedia::default();
     queue.retain(|batch| {
-        let discard = !batch.started && batch.kind == SendBatchKind::Video;
+        let discard = !batch.started && batch.kind.is_video();
         if discard {
             record_drop(&mut dropped, batch);
         }
@@ -234,7 +251,7 @@ fn purge_group_transition_media(
     }
     purge_queued(queue, pending_video, awaiting_video_keyframe, |batch| {
         (epoch_advanced && batch.kind != SendBatchKind::Control)
-            || (audio_only && batch.kind == SendBatchKind::Video)
+            || (audio_only && batch.kind.is_video())
     })
 }
 
@@ -481,7 +498,12 @@ fn shed_to_cap(
         // Never cut an AU after one of its fragments has entered the transport.
         let victim = queue
             .iter()
-            .position(|batch| !batch.started && batch.kind == SendBatchKind::Video)
+            .position(|batch| !batch.started && batch.kind == SendBatchKind::VideoRetransmission)
+            .or_else(|| {
+                queue
+                    .iter()
+                    .position(|batch| !batch.started && batch.kind == SendBatchKind::Video)
+            })
             .or_else(|| {
                 queue
                     .iter()
@@ -571,7 +593,11 @@ fn pop_next_packet(
     let first = |kind| queue.iter().position(|batch| batch.kind == kind);
     let index = first(SendBatchKind::Control)
         .or_else(|| first(SendBatchKind::Media))
-        .or_else(|| video_ready.then(|| first(SendBatchKind::Video)).flatten())?;
+        .or_else(|| {
+            video_ready
+                .then(|| queue.iter().position(|batch| batch.kind.is_video()))
+                .flatten()
+        })?;
     let batch = queue.get_mut(index)?;
     batch.started = true;
     let kind = batch.kind;
@@ -802,13 +828,21 @@ async fn run_call_with_clock_and_wallclock(
         loop {
             match eng.poll_output() {
                 // Queue for the in-flight send arm; never await the write in this loop.
-                Output::Transmit(data) => {
-                    let dropped = queue_transmit(
-                        &mut send_queue,
-                        &mut pending_video,
-                        &mut awaiting_video_keyframe,
-                        data,
-                    );
+                output @ (Output::Transmit(_) | Output::RetransmitVideo(_)) => {
+                    let dropped = match output {
+                        Output::RetransmitVideo(data) => enqueue_batch(
+                            &mut send_queue,
+                            &mut awaiting_video_keyframe,
+                            SendBatch::retransmit_video(data),
+                        ),
+                        Output::Transmit(data) => queue_transmit(
+                            &mut send_queue,
+                            &mut pending_video,
+                            &mut awaiting_video_keyframe,
+                            data,
+                        ),
+                        _ => unreachable!(),
+                    };
                     if dropped.packets != 0 {
                         let _ = channels.events.try_send(CallEvent::OutboundMediaDropped {
                             video_access_units: dropped.video_access_units,
@@ -958,7 +992,7 @@ async fn run_call_with_clock_and_wallclock(
         if sending.future.is_terminated()
             && let Some((data, kind)) = pop_next_packet(&mut send_queue, pacer.ready(now))
         {
-            if kind == SendBatchKind::Video {
+            if kind.is_video() {
                 pacer.sent(now, data.len());
             }
             let t = transport.clone();
@@ -971,9 +1005,7 @@ async fn run_call_with_clock_and_wallclock(
         // Nothing went out although video is queued: the pacer is holding it. Wake when it may go.
         // A send in flight needs no timer, since its completion wakes the loop anyway.
         let pace_due = (sending.future.is_terminated()
-            && send_queue
-                .iter()
-                .any(|batch| batch.kind == SendBatchKind::Video))
+            && send_queue.iter().any(|batch| batch.kind.is_video()))
         .then(|| pacer.ready_at());
         if pace_due != armed_pace || (pace_due.is_some() && pace_timer.is_terminated()) {
             pace_timer = match pace_due {
@@ -3285,6 +3317,239 @@ mod tests {
         );
     }
 
+    struct ManualSleep {
+        clock: Arc<AtomicU64>,
+        deadlines: Arc<Mutex<HashMap<usize, u64>>>,
+        id: usize,
+        at: u64,
+    }
+
+    impl Future for ManualSleep {
+        type Output = ();
+        fn poll(self: Pin<&mut Self>, _: &mut std::task::Context<'_>) -> std::task::Poll<()> {
+            if self.clock.load(Ordering::Relaxed) >= self.at {
+                self.deadlines.lock().unwrap().remove(&self.id);
+                std::task::Poll::Ready(())
+            } else {
+                std::task::Poll::Pending
+            }
+        }
+    }
+
+    impl Drop for ManualSleep {
+        fn drop(&mut self) {
+            self.deadlines.lock().unwrap().remove(&self.id);
+        }
+    }
+
+    #[derive(Default)]
+    struct ManualDeadlineRuntime {
+        clock: Arc<AtomicU64>,
+        deadlines: Arc<Mutex<HashMap<usize, u64>>>,
+        next_id: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Runtime for ManualDeadlineRuntime {
+        fn spawn(&self, _: Pin<Box<dyn Future<Output = ()> + Send + 'static>>) -> AbortHandle {
+            AbortHandle::noop()
+        }
+        fn sleep(&self, duration: Duration) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+            let at = self.clock.load(Ordering::Relaxed) + duration.as_millis() as u64;
+            let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+            self.deadlines.lock().unwrap().insert(id, at);
+            Box::pin(ManualSleep {
+                clock: self.clock.clone(),
+                deadlines: self.deadlines.clone(),
+                id,
+                at,
+            })
+        }
+        fn spawn_blocking(
+            &self,
+            _: Box<dyn FnOnce() + Send + 'static>,
+        ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+            Box::pin(async {})
+        }
+        fn yield_now(&self) -> Option<Pin<Box<dyn Future<Output = ()> + Send>>> {
+            None
+        }
+    }
+
+    #[test]
+    fn pacing_deadlines_wake_the_idle_driver_and_pace_retransmissions() {
+        struct TimedRelay {
+            clock: Arc<AtomicU64>,
+            events: async_channel::Sender<RelayTransportEvent>,
+            sent: Mutex<Vec<(u64, Bytes)>>,
+            nack: Mutex<Option<Bytes>>,
+        }
+        #[async_trait]
+        impl RelayTransport for TimedRelay {
+            async fn send(&self, packet: Bytes) -> anyhow::Result<()> {
+                let video = parse_rtp_header(&packet)
+                    .is_some_and(|h| h.payload_type == RTP_PAYLOAD_TYPE_H264);
+                self.sent
+                    .lock()
+                    .unwrap()
+                    .push((self.clock.load(Ordering::Relaxed), packet));
+                if video && let Some(nack) = self.nack.lock().unwrap().take() {
+                    self.events
+                        .try_send(RelayTransportEvent::PacketReceived(nack))
+                        .unwrap();
+                }
+                Ok(())
+            }
+            async fn disconnect(&self) {}
+        }
+        use crate::voip::e2e_srtp::{derive_srtcp_keys, protect_srtcp};
+        use crate::voip::ssrc;
+        let mut cfg = config();
+        cfg.enable_video = true;
+        let video_ssrc = ssrc::derive_video_participant_ssrc(
+            &cfg.call_id,
+            &ssrc::format_e2e_srtp_participant_id(&cfg.self_lid),
+        );
+        let peer_ssrc = 0x12345678u32;
+        let mut nack = vec![0x91, crate::voip::rtcp::RTCP_PT_RTPFB, 0, 3];
+        nack.extend_from_slice(&peer_ssrc.to_be_bytes());
+        nack.extend_from_slice(&video_ssrc.to_be_bytes());
+        nack.extend_from_slice(&[0, 1, 0, 0]);
+        let keys = derive_srtcp_keys(&cfg.call_key, &cfg.peer_lid).unwrap();
+        let nack = Bytes::from(protect_srtcp(&keys, peer_ssrc, 1, &nack));
+        let rt = Arc::new(ManualDeadlineRuntime::default());
+        let (relay_tx, relay_rx) = async_channel::unbounded();
+        let transport = Arc::new(TimedRelay {
+            clock: rt.clock.clone(),
+            events: relay_tx.clone(),
+            sent: Mutex::new(Vec::new()),
+            nack: Mutex::new(Some(nack)),
+        });
+        let (_mic_tx, mic_rx) = async_channel::unbounded();
+        let (speaker, _) = async_channel::unbounded();
+        let (events, _) = async_channel::unbounded();
+        let mut channels = test_channels(mic_rx, speaker, events);
+        let (video_tx, video_rx) = async_channel::unbounded();
+        channels.video_in = video_rx;
+        let mut au = vec![0, 0, 0, 1, 0x65];
+        au.extend(vec![0x55; 3000]);
+        video_tx.try_send(au).unwrap();
+        let engine = CallEngine::new(cfg, Box::new(SequentialTxIds::new())).unwrap();
+        let clock = rt.clock.clone();
+        let mut drive = Box::pin(run_call_with_clock(
+            rt.clone(),
+            transport.clone(),
+            relay_rx,
+            channels,
+            engine,
+            move || clock.load(Ordering::Relaxed),
+        ));
+        let mut context = std::task::Context::from_waker(futures::task::noop_waker_ref());
+        for _ in 0..100 {
+            assert!(drive.as_mut().poll(&mut context).is_pending());
+            let count = transport
+                .sent
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, p)| {
+                    parse_rtp_header(p).is_some_and(|h| h.payload_type == RTP_PAYLOAD_TYPE_H264)
+                })
+                .count();
+            if count == 5 {
+                break;
+            }
+            let at = *rt
+                .deadlines
+                .lock()
+                .unwrap()
+                .values()
+                .min()
+                .expect("driver armed a deadline");
+            assert!(at > rt.clock.load(Ordering::Relaxed), "no busy timer loop");
+            rt.clock.store(at, Ordering::Relaxed);
+        }
+        let video: Vec<_> = transport
+            .sent
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, p)| {
+                parse_rtp_header(p).is_some_and(|h| h.payload_type == RTP_PAYLOAD_TYPE_H264)
+            })
+            .cloned()
+            .collect();
+        assert_eq!(video.len(), 5, "four new fragments and one retransmission");
+        assert_eq!(
+            video[1].1, video[4].1,
+            "retransmit the original protected fragment"
+        );
+        // At this small volume the 1 Mbit/s floor applies: each byte costs 8 us,
+        // with a 5 ms burst allowance. Check dispatch times, not only packet count.
+        let mut next_us = 0u64;
+        for (at, packet) in &video {
+            let expected = next_us.saturating_sub(5000).div_ceil(1000);
+            assert_eq!(*at, expected);
+            next_us = next_us.max(at * 1000) + packet.len() as u64 * 8;
+        }
+        relay_tx.close();
+        assert!(drive.as_mut().poll(&mut context).is_ready());
+        assert!(
+            rt.deadlines.lock().unwrap().is_empty(),
+            "cancel timers on exit"
+        );
+    }
+
+    #[test]
+    fn retransmitted_idr_fragments_preserve_the_send_queue_recovery_gate() {
+        use crate::voip::rtp::{VideoRtpStream, encode_rtp_header};
+        let mut stream = VideoRtpStream::new(0x11223344, 4500).unwrap();
+        let fragment = Bytes::from(encode_rtp_header(
+            &stream.next_video_packet(false, VIDEO_MEDIA_FRAME_INFO_IDR),
+        ));
+        let mut gate = SendKeyframeGate::default();
+        let mut queue = VecDeque::new();
+        prepare_relay_reconnect(&mut queue, &mut Vec::new(), &mut gate);
+        enqueue_batch(
+            &mut queue,
+            &mut gate,
+            SendBatch::retransmit_video(fragment.clone()),
+        );
+        assert!(gate.awaiting());
+        assert!(
+            pop_next_packet(&mut queue, false).is_none(),
+            "retransmissions obey video pacing"
+        );
+        assert_eq!(pop_next_packet(&mut queue, true).unwrap().0, fragment);
+        let delta = Bytes::from(encode_rtp_header(&stream.next_video_packet(true, 0)));
+        assert_eq!(
+            enqueue_batch(&mut queue, &mut gate, SendBatch::video(vec![delta])).video_access_units,
+            1
+        );
+        let idr = Bytes::from(encode_rtp_header(
+            &stream.next_video_packet(true, VIDEO_MEDIA_FRAME_INFO_IDR),
+        ));
+        enqueue_batch(&mut queue, &mut gate, SendBatch::video(vec![idr]));
+        assert!(!gate.awaiting(), "a fresh complete IDR repairs the gate");
+        queue.clear();
+        let mut resend = SendBatch::retransmit_video(fragment);
+        resend.bytes = SEND_QUEUE_BYTE_CAP + 1;
+        let dropped = enqueue_batch(&mut queue, &mut gate, resend);
+        assert_eq!(dropped.packets, 1);
+        assert_eq!(dropped.video_access_units, 0);
+        assert!(
+            !gate.awaiting(),
+            "shedding an optional resend does not lose a new picture"
+        );
+        let mut sending = InFlightSend {
+            future: futures::future::pending().boxed().fuse(),
+            kind: Some(SendBatchKind::VideoRetransmission),
+        };
+        let cancelled = cancel_in_flight_group_media(&mut sending, true, false);
+        assert_eq!(cancelled.packets, 1);
+        assert_eq!(cancelled.video_access_units, 0);
+    }
+
     /// Drain `queue` the way the drive loop does, one packet whenever the pacer allows, with the
     /// clock jumping to the pacer's next moment whenever it holds video back. Returns when each
     /// packet left, by kind.
@@ -3297,7 +3562,7 @@ mod tests {
         while !queue.is_empty() {
             match pop_next_packet(queue, pacer.ready(now)) {
                 Some((packet, kind)) => {
-                    if kind == SendBatchKind::Video {
+                    if kind.is_video() {
                         pacer.sent(now, packet.len());
                     }
                     sent.push((now, kind));

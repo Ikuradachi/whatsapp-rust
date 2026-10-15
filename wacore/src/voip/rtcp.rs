@@ -155,6 +155,21 @@ pub fn summarize_rtcp(data: &[u8]) -> Option<RtcpSummary> {
             return None;
         }
 
+        // RTCP padding belongs only to the final compound member and is not FCI.
+        let packet = if packet[0] & 0x20 != 0 {
+            let padding = usize::from(*packet.last()?);
+            if offset + packet_len != data.len()
+                || padding == 0
+                || padding % 4 != 0
+                || padding > packet.len() - RTCP_HEADER_LEN
+            {
+                return None;
+            }
+            &packet[..packet.len() - padding]
+        } else {
+            packet
+        };
+
         let packet_type = packet[1];
         let raw_count = (packet[0] & 0x1f) as usize;
         let this_sender = u32::from_be_bytes(packet[4..8].try_into().ok()?);
@@ -800,6 +815,37 @@ mod frame_span_tests {
 mod tests {
     use super::*;
     use crate::voip::testkat::kats;
+
+    #[test]
+    fn feedback_padding_is_not_control_information() {
+        let mut nack = vec![0xa1, RTCP_PT_RTPFB, 0, 4];
+        nack.extend_from_slice(&1u32.to_be_bytes());
+        nack.extend_from_slice(&2u32.to_be_bytes());
+        nack.extend_from_slice(&[0, 10, 0, 0]);
+        nack.extend_from_slice(&[0, 0, 0, 4]);
+        let summary = summarize_rtcp(&nack).unwrap();
+        assert_eq!(summary.feedback[0].fci, [0, 10, 0, 0]);
+        let mut unpadded = nack[..16].to_vec();
+        unpadded[0] &= !0x20;
+        unpadded[3] = 3;
+        assert_eq!(
+            summarize_rtcp(&unpadded).unwrap().feedback,
+            summary.feedback
+        );
+        for count in [0, 1, 16, 255] {
+            *nack.last_mut().unwrap() = count;
+            assert!(
+                summarize_rtcp(&nack).is_none(),
+                "invalid padding count {count}"
+            );
+        }
+        *nack.last_mut().unwrap() = 4;
+        nack.extend_from_slice(&unpadded);
+        assert!(
+            summarize_rtcp(&nack).is_none(),
+            "only the final compound member may be padded"
+        );
+    }
 
     #[test]
     fn compact_reports_match_kat() {
