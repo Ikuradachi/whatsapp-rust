@@ -347,6 +347,12 @@ fn window_delta(now: &CallMediaStats, then: &CallMediaStats) -> CallMediaStats {
             .saturating_sub(then.auxiliary_rtp_authenticated),
         // NOT a delta either: it names a type, it does not count one.
         last_unexpected_payload_type: now.last_unexpected_payload_type,
+        video_nack_requested: now
+            .video_nack_requested
+            .saturating_sub(then.video_nack_requested),
+        video_retransmitted: now
+            .video_retransmitted
+            .saturating_sub(then.video_retransmitted),
     }
 }
 

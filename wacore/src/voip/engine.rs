@@ -37,7 +37,7 @@ pub use super::media_stats::AudioSilenceReason;
 #[cfg(feature = "voip-mlow")]
 use super::mlow;
 use super::rtcp::{
-    RTCP_PT_PSFB, RtcpFeedback, RtpReceptionStats, build_whatsapp_rtcp_cname,
+    RTCP_PT_PSFB, RTCP_PT_RTPFB, RtcpFeedback, RtpReceptionStats, build_whatsapp_rtcp_cname,
     parse_sender_report_timing, summarize_rtcp,
 };
 #[cfg(feature = "voip-mlow")]
@@ -790,6 +790,76 @@ struct VideoPlaneState {
     /// leave a plane that was born requiring an IDR -- every plane is --
     /// waiting for a request nobody ever made.
     keyframe_announced: bool,
+    /// Our latest video packets as they went on the wire, for the peer's NACKs.
+    sent: SentVideoHistory,
+}
+
+/// How many of our latest video packets are kept for retransmission: a second or more of video at
+/// the rates a call sends, which is longer than a NACK takes to come back over any path a call
+/// could hold up on.
+const SENT_VIDEO_HISTORY: usize = 512;
+/// How many times one packet is sent again. The peer asks again when a retransmission is lost too,
+/// and a bound keeps a peer that keeps asking from turning one packet into a stream of them.
+const MAX_VIDEO_RESENDS: u8 = 2;
+
+/// Our latest video packets, protected, in the order they were sent.
+///
+/// Kept protected rather than re-protected on demand: a retransmission is the same packet again,
+/// with the same sequence number and SRTP index, which a receiver that never got the first one
+/// accepts as an ordinary late arrival. Protecting it afresh would need the sequence number to
+/// move, and then it would no longer be the packet that was lost.
+#[derive(Default)]
+struct SentVideoHistory {
+    packets: VecDeque<(u16, Bytes, u8)>,
+}
+
+impl SentVideoHistory {
+    fn record(&mut self, packet: &Bytes) {
+        let Some(sequence) = packet
+            .get(2..4)
+            .map(|seq| u16::from_be_bytes([seq[0], seq[1]]))
+        else {
+            return;
+        };
+        if self.packets.len() == SENT_VIDEO_HISTORY {
+            self.packets.pop_front();
+        }
+        self.packets.push_back((sequence, packet.clone(), 0));
+    }
+
+    /// The packet with `sequence`, if it is still held and has not been sent again too often.
+    fn resend(&mut self, sequence: u16) -> Option<Bytes> {
+        let first = self.packets.front()?.0;
+        let index = usize::from(sequence.wrapping_sub(first));
+        let (held, packet, resends) = self.packets.get_mut(index)?;
+        if *held != sequence || *resends >= MAX_VIDEO_RESENDS {
+            return None;
+        }
+        *resends += 1;
+        Some(packet.clone())
+    }
+}
+
+/// The sequence numbers of `video_ssrc` the peer's generic NACKs (RFC 4585 section 6.2.1) ask for:
+/// each FCI row names one packet and, in its bitmask, the sixteen after it.
+fn nacked_video_sequences(feedback: &[RtcpFeedback], video_ssrc: u32) -> Vec<u16> {
+    let mut sequences = Vec::new();
+    for item in feedback {
+        if item.packet_type != RTCP_PT_RTPFB || item.fmt != 1 || item.media_ssrc != video_ssrc {
+            continue;
+        }
+        for row in item.fci.chunks_exact(4) {
+            let first = u16::from_be_bytes([row[0], row[1]]);
+            let following = u16::from_be_bytes([row[2], row[3]]);
+            sequences.push(first);
+            sequences.extend(
+                (0..16u16)
+                    .filter(|bit| following & (1 << bit) != 0)
+                    .map(|bit| first.wrapping_add(bit + 1)),
+            );
+        }
+    }
+    sequences
 }
 
 /// Whether a peer-keyframe request may be coalesced with a recent one.
@@ -875,6 +945,7 @@ fn make_video_plane(
         keyframe_required: true,
         peer_keyframe_asked_at: None,
         keyframe_announced: false,
+        sent: SentVideoHistory::default(),
     })
 }
 
@@ -2654,6 +2725,21 @@ impl CallEngine {
                 newly_needs_keyframe = true;
                 video.keyframe_required = true;
             }
+            // The peer lost some of our video and asks for it again. Answered while video is on
+            // the wire; a gated or downgraded plane has nothing it may send.
+            if let Some(video_ssrc) = video_ssrc
+                && let Some(video) = m.video.as_mut().filter(|v| v.active && !v.send_gated)
+            {
+                for sequence in nacked_video_sequences(&summary.feedback, video_ssrc) {
+                    self.media_stats.video_nack_requested =
+                        self.media_stats.video_nack_requested.saturating_add(1);
+                    if let Some(packet) = video.sent.resend(sequence) {
+                        self.media_stats.video_retransmitted =
+                            self.media_stats.video_retransmitted.saturating_add(1);
+                        self.outbox.push_back(Output::Transmit(packet));
+                    }
+                }
+            }
             if let Some((sender, ntp_seconds, ntp_fraction)) = parse_sender_report_timing(&plain) {
                 m.audio_reception
                     .observe_sender_report(sender, ntp_seconds, ntp_fraction, now);
@@ -3864,8 +3950,15 @@ impl CallEngine {
         }
         v.keyframe_required = false;
         v.keyframe_announced = false;
+        // A group call's packets belong to one SRTP epoch, which a rekey retires; only a 1:1
+        // call answers NACKs, so only it keeps them.
+        let answers_nacks = self.group.is_none();
         for packet in packets {
-            self.outbox.push_back(Output::Transmit(Bytes::from(packet)));
+            let packet = Bytes::from(packet);
+            if answers_nacks {
+                v.sent.record(&packet);
+            }
+            self.outbox.push_back(Output::Transmit(packet));
         }
     }
 }
@@ -10244,6 +10337,108 @@ mod tests {
             1,
             "forged feedback must not re-arm keyframe recovery"
         );
+    }
+
+    #[test]
+    fn a_nack_for_our_video_sends_the_same_packets_again() {
+        use crate::voip::e2e_srtp::{derive_srtcp_keys, protect_srtcp};
+
+        let mut cfg = config(true);
+        cfg.enable_video = true;
+        let call_key = cfg.call_key.clone();
+        let video_ssrc = ssrc::derive_video_participant_ssrc(
+            &cfg.call_id,
+            &ssrc::format_e2e_srtp_participant_id(&cfg.self_lid),
+        );
+        let peer_ssrc = ssrc::derive_wasm_participant_ssrc(
+            &cfg.call_id,
+            &ssrc::format_e2e_srtp_participant_id(&cfg.peer_lid),
+            0,
+        );
+        let peer_keys = derive_srtcp_keys(&call_key, PEER_LID).unwrap();
+        let mut srtcp_index = 0;
+        let mut nack = |byte0: u8, rows: &[(u16, u16)]| {
+            let mut packet = vec![byte0, RTCP_PT_RTPFB, 0, 2 + rows.len() as u8];
+            packet.extend_from_slice(&peer_ssrc.to_be_bytes());
+            packet.extend_from_slice(&video_ssrc.to_be_bytes());
+            for (first, following) in rows {
+                packet.extend_from_slice(&first.to_be_bytes());
+                packet.extend_from_slice(&following.to_be_bytes());
+            }
+            srtcp_index += 1;
+            protect_srtcp(&peer_keys, peer_ssrc, srtcp_index, &packet)
+        };
+        let video_packets = |outs: &[Output]| -> Vec<Bytes> {
+            outs.iter()
+                .filter_map(|output| match output {
+                    Output::Transmit(packet)
+                        if parse_rtp_header(packet)
+                            .is_some_and(|h| h.payload_type == RTP_PAYLOAD_TYPE_H264) =>
+                    {
+                        Some(packet.clone())
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+
+        let mut eng = CallEngine::new(cfg, Box::new(SequentialTxIds::new())).unwrap();
+        eng.start(0, 0);
+        let _ = drain(&mut eng);
+        eng.handle_input(1, Input::VideoFrame(&video_au(4000)));
+        let sent = video_packets(&drain(&mut eng).0);
+        assert!(sent.len() >= 4, "the keyframe spans several packets");
+        let seq = |packet: &Bytes| parse_rtp_header(packet).unwrap().sequence_number;
+
+        // The second packet, the one after it through the bitmask, and one never sent. Sent on the
+        // native video profile, which sets bit 4 beside the FMT.
+        let never_sent = seq(&sent[0]).wrapping_sub(100);
+        eng.handle_input(
+            2,
+            Input::RelayPacket(&nack(0x91, &[(seq(&sent[1]), 0b1), (never_sent, 0)])),
+        );
+        let resent = video_packets(&drain(&mut eng).0);
+        assert_eq!(
+            resent,
+            [sent[1].clone(), sent[2].clone()],
+            "the very packets that were lost, byte for byte"
+        );
+        let stats = eng.media_stats();
+        assert_eq!(stats.video_nack_requested, 3);
+        assert_eq!(stats.video_retransmitted, 2);
+
+        // A packet is sent again at most twice, however often the peer asks.
+        for at in 3..6 {
+            eng.handle_input(at, Input::RelayPacket(&nack(0x81, &[(seq(&sent[1]), 0)])));
+        }
+        assert_eq!(video_packets(&drain(&mut eng).0), [sent[1].clone()]);
+        assert_eq!(eng.media_stats().video_retransmitted, 3);
+    }
+
+    #[test]
+    fn nacks_name_the_packets_their_bitmask_follows_on_our_stream_only() {
+        let video_ssrc = 0x1122_3344;
+        let nack = |media_ssrc, fci: &[u8]| RtcpFeedback {
+            packet_type: RTCP_PT_RTPFB,
+            fmt: 1,
+            sender_ssrc: 0x99aa_bbcc,
+            media_ssrc,
+            fci: fci.to_vec(),
+        };
+        // 65535, then bits 0 and 15: the two packets either side of the wrap and the last one.
+        assert_eq!(
+            nacked_video_sequences(&[nack(video_ssrc, &[0xff, 0xff, 0x80, 0x01])], video_ssrc),
+            [65535, 0, 15]
+        );
+        assert!(
+            nacked_video_sequences(&[nack(0x5566_7788, &[0, 1, 0, 0])], video_ssrc).is_empty(),
+            "a NACK about another stream is not ours to answer"
+        );
+        let pli = RtcpFeedback {
+            packet_type: RTCP_PT_PSFB,
+            ..nack(video_ssrc, &[0, 1, 0, 0])
+        };
+        assert!(nacked_video_sequences(&[pli], video_ssrc).is_empty());
     }
 
     #[test]
