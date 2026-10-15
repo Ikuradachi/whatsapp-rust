@@ -12,6 +12,11 @@ pub use crate::voip_control::audio_format::{
 
 impl AudioFormat {
     /// Identify the actual inbound codec after the negotiated RTP profile is known.
+    ///
+    /// The separate MLOW type (`mlow-1`, 122) is read exactly like the shared one: its first byte is
+    /// an MLOW TOC, and the escape marker (SID and VAD both set) is not a TOC any MLOW frame can
+    /// have, so it means the same thing on either type. Only the redundancy type differs, because
+    /// its first byte is the RED framing rather than a TOC.
     pub fn inbound_codec(self, payload_type: u8, payload: &[u8]) -> AudioCodec {
         match self.rtp_profile {
             AudioRtpProfile::StandardOpus => AudioCodec::Opus,
@@ -464,6 +469,37 @@ mod tests {
             !AudioFormat::OPUS_MLOW_16KHZ_60MS
                 .accepts_rtp_payload_type(crate::voip::rtp::RTP_PAYLOAD_TYPE_OPUS)
         );
+    }
+
+    // A video offer announces capability 38, `enable_mlow_separate_pt_tx`, and a WhatsApp peer that
+    // takes it at its word moves every MLOW frame to `mlow-1` (122). Read only as 120 and 121, that
+    // is a video call in which the peer's audio is discarded whole as an unexpected payload type.
+    #[test]
+    fn the_mlow_profile_takes_mlow_on_its_separate_payload_type() {
+        use crate::voip::rtp::RTP_PAYLOAD_TYPE_MLOW_SEPARATE;
+        assert_eq!(RTP_PAYLOAD_TYPE_MLOW_SEPARATE, 122);
+        for format in [
+            AudioFormat::MLOW_16KHZ_60MS,
+            AudioFormat::OPUS_MLOW_16KHZ_60MS,
+        ] {
+            assert!(format.accepts_rtp_payload_type(RTP_PAYLOAD_TYPE_MLOW_SEPARATE));
+            assert_eq!(
+                format.inbound_codec(RTP_PAYLOAD_TYPE_MLOW_SEPARATE, &[0x50, 1, 2]),
+                AudioCodec::Mlow
+            );
+            // The escape marker is no MLOW TOC, so it means the same thing on 122 as on 120.
+            assert_eq!(
+                format.inbound_codec(RTP_PAYLOAD_TYPE_MLOW_SEPARATE, &[0xF8, 1, 2]),
+                AudioCodec::Opus
+            );
+        }
+        // Standard Opus has no MLOW to carry: the type stays outside its profile.
+        for format in [
+            AudioFormat::OPUS_16KHZ_60MS,
+            AudioFormat::OPUS_RFC7587_16KHZ_60MS,
+        ] {
+            assert!(!format.accepts_rtp_payload_type(RTP_PAYLOAD_TYPE_MLOW_SEPARATE));
+        }
     }
 
     #[test]

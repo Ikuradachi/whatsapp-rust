@@ -48,6 +48,13 @@ pub const RTP_PAYLOAD_TYPE_WHATSAPP_AUDIO: u8 = 120;
 pub const RTP_PAYLOAD_TYPE_MLOW: u8 = RTP_PAYLOAD_TYPE_WHATSAPP_AUDIO;
 /// MLOW SplitRed redundancy payload type (`mlow-red-1`).
 pub const RTP_PAYLOAD_TYPE_MLOW_RED: u8 = 121;
+/// MLOW on a payload type of its own (`mlow-1`).
+///
+/// A sender moves its MLOW frames here, off the shared [`RTP_PAYLOAD_TYPE_WHATSAPP_AUDIO`], once
+/// the call has enabled `enable_mlow_separate_pt_tx`: capability index 38, which a 1:1 video offer
+/// announces. WhatsApp's own receiver registers this type as `mlow-1` beside 120 and 121; one that
+/// knows only those two discards every frame a peer sends here as an unexpected payload type.
+pub const RTP_PAYLOAD_TYPE_MLOW_SEPARATE: u8 = 122;
 
 /// Fixed audio timing for one call.
 ///
@@ -149,7 +156,8 @@ impl AudioFormat {
     pub const fn accepts_rtp_payload_type(self, payload_type: u8) -> bool {
         payload_type == self.rtp_payload_type
             || matches!(self.rtp_profile, AudioRtpProfile::Mlow)
-                && payload_type == RTP_PAYLOAD_TYPE_MLOW_RED
+                && (payload_type == RTP_PAYLOAD_TYPE_MLOW_RED
+                    || payload_type == RTP_PAYLOAD_TYPE_MLOW_SEPARATE)
     }
 
     /// The sibling format carrying `codec` at this format's exact timing, if one exists.

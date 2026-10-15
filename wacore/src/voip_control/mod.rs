@@ -499,6 +499,7 @@ pub struct MediaStats {
     pub rtp_received: u32,
     #[builder(default)]
     pub rtp_payload_type_unexpected: u32,
+    /// Audio SRTP failures, including video carriers that advertise piggybacked audio.
     #[builder(default)]
     pub srtp_unprotect_failed: u32,
     #[builder(default)]
@@ -535,6 +536,29 @@ pub struct MediaStats {
     pub forwarding_envelope_rejected: u32,
     #[builder(default)]
     pub codec_switches: u16,
+    /// Video RTP packets on the direct path whose tag authenticated, whether or not a video plane
+    /// was active to show them.
+    ///
+    /// The video half of `rtp_received`. Without it a call showing no picture cannot say whether
+    /// the peer's video never arrived or arrived and was not usable.
+    #[builder(default)]
+    pub video_rtp_received: u32,
+    /// Video RTP packets on the direct path whose tag did not authenticate, with or without an
+    /// active video plane: wrong recv keys, or keys for a device other than the one sending.
+    #[builder(default)]
+    pub video_srtp_unprotect_failed: u32,
+    /// Audio RTP packets recovered from inside another packet the peer sent: its video and video
+    /// FEC packets carry its audio piggybacked in a video call.
+    #[builder(default)]
+    pub piggybacked_audio_received: u32,
+    /// Packets on a payload type outside the audio profile that nevertheless authenticated under the
+    /// peer's keys: its FEC, retransmission or app-data streams rather than noise or a stale key.
+    #[builder(default)]
+    pub auxiliary_rtp_authenticated: u32,
+    /// The payload type of the most recent packet counted in `rtp_payload_type_unexpected`, so a
+    /// report can name the type instead of only counting it. Zero until one arrives.
+    #[builder(default)]
+    pub last_unexpected_payload_type: u8,
 }
 
 impl MediaStats {

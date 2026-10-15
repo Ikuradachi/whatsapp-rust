@@ -12,6 +12,8 @@ pub const RTP_PAYLOAD_TYPE_WHATSAPP_AUDIO: u8 = 120;
 pub const RTP_PAYLOAD_TYPE_MLOW: u8 = RTP_PAYLOAD_TYPE_WHATSAPP_AUDIO;
 /// MLOW SplitRed redundancy payload type (`mlow-red-1`).
 pub const RTP_PAYLOAD_TYPE_MLOW_RED: u8 = 121;
+/// MLOW on a payload type of its own (`mlow-1`); see the contract's definition.
+pub use crate::voip_control::audio_format::RTP_PAYLOAD_TYPE_MLOW_SEPARATE;
 /// H.264 video payload type used by captured Android video RTP.
 pub const RTP_PAYLOAD_TYPE_H264: u8 = 97;
 /// RTC app-data stream carrying reactions and future in-call controls.
@@ -89,7 +91,10 @@ pub const OPUS_PRIMING_FRAME_2: [u8; 5] = [0x90, 0xb8, 0x14, 0x14, 0xc4];
 pub fn is_whatsapp_opus_rtp_payload(payload_type: u8) -> bool {
     matches!(
         payload_type,
-        RTP_PAYLOAD_TYPE_OPUS | RTP_PAYLOAD_TYPE_MLOW | RTP_PAYLOAD_TYPE_MLOW_RED
+        RTP_PAYLOAD_TYPE_OPUS
+            | RTP_PAYLOAD_TYPE_MLOW
+            | RTP_PAYLOAD_TYPE_MLOW_RED
+            | RTP_PAYLOAD_TYPE_MLOW_SEPARATE
     )
 }
 
@@ -260,6 +265,88 @@ pub fn parse_whatsapp_media_frame_info(data: &[u8]) -> Option<u8> {
         }
     }
     info.into_iter().flatten().next()
+}
+
+/// RFC 8285's one-byte header extension profile. WhatsApp's own stack registers its one-byte
+/// element parser under this profile as well as under [`WHATSAPP_RTP_EXTENSION_PROFILE`].
+pub const RFC8285_ONE_BYTE_EXTENSION_PROFILE: u16 = 0xbede;
+
+/// One-byte extension element of WhatsApp's audio piggyback (`AP` in its extender table).
+///
+/// Two bytes, big-endian: how many bytes at the start of the RTP payload are the packet's own
+/// media. Whatever follows them is a complete audio RTP packet -- header, payload, no tag -- that
+/// the sender's audio stream handed to this packet instead of sending it on its own. A WhatsApp
+/// client does this in video calls: its video encoder takes the next queued audio packet onto each
+/// video and video-FEC packet, and only audio that finds no carrier within a timeout goes out alone.
+/// The receiver splits it back off after the outer packet authenticates and decrypts, which is why
+/// the audio packet inside carries no SRTP of its own.
+pub const WHATSAPP_RTP_EXTENSION_AUDIO_PIGGYBACK_ID: u8 = 7;
+
+/// The payload offset at which a piggybacked audio packet starts, as the packet's header states it.
+///
+/// `None` when the packet has no audio piggyback element. The header is in the clear, so this can
+/// be read before decryption, but the offset only means something for an authenticated packet.
+/// A truncated element ends the scan, and the reserved id 15 stops it as RFC 8285 says.
+pub fn parse_whatsapp_audio_piggyback_offset(data: &[u8]) -> Option<usize> {
+    let (Some(profile), mut extension) = rtp_extension_profile_and_data(data)? else {
+        return None;
+    };
+    if profile != WHATSAPP_RTP_EXTENSION_PROFILE && profile != RFC8285_ONE_BYTE_EXTENSION_PROFILE {
+        return None;
+    }
+    while let Some((&header, rest)) = extension.split_first() {
+        extension = rest;
+        let id = header >> 4;
+        if id == 0 {
+            continue;
+        }
+        if id == 15 {
+            break;
+        }
+        let len = usize::from(header & 0x0f) + 1;
+        let Some((value, rest)) = extension.split_at_checked(len) else {
+            break;
+        };
+        extension = rest;
+        if id == WHATSAPP_RTP_EXTENSION_AUDIO_PIGGYBACK_ID && len == 2 {
+            return Some(usize::from(u16::from_be_bytes([value[0], value[1]])));
+        }
+    }
+    None
+}
+
+/// Split a piggybacked audio packet off the decrypted `payload` of `packet`.
+///
+/// On return `payload` holds the packet's own media only, and the audio packet comes back whole.
+/// Mirrors the receiver in WhatsApp's own stack: an offset of zero, or one that leaves no audio
+/// behind it, is not a piggyback and leaves the payload alone; RTP padding, when the outer packet
+/// has the P bit, belongs to the media part and is removed from its end.
+pub fn split_whatsapp_audio_piggyback(packet: &[u8], payload: &mut Vec<u8>) -> Option<Vec<u8>> {
+    let offset = parse_whatsapp_audio_piggyback_offset(packet)?;
+    if offset == 0 || offset >= payload.len() {
+        return None;
+    }
+    let audio = payload.split_off(offset);
+    let padded = packet.first().is_some_and(|byte| byte & 0x20 != 0);
+    if padded && let Some(&padding) = payload.last() {
+        let padding = usize::from(padding);
+        if padding <= payload.len() {
+            payload.truncate(payload.len() - padding);
+        }
+    }
+    Some(audio)
+}
+
+/// The payload of a plain (unprotected) RTP packet: after the fixed header, CSRCs and extension
+/// block, and without RTP padding. `None` for a packet with no payload left.
+pub fn plain_rtp_payload(packet: &[u8]) -> Option<&[u8]> {
+    let header_len = rtp_header_byte_length(packet)?;
+    let mut payload = packet.get(header_len..)?;
+    if packet[0] & 0x20 != 0 {
+        let padding = usize::from(*payload.last()?);
+        payload = payload.get(..payload.len().checked_sub(padding)?)?;
+    }
+    (!payload.is_empty()).then_some(payload)
 }
 
 /// Decode the exact outgoing WhatsApp video extension set. Other 0xdebe layouts,
@@ -642,6 +729,7 @@ mod tests {
         assert!(is_whatsapp_opus_rtp_payload(111));
         assert!(is_whatsapp_opus_rtp_payload(120));
         assert!(is_whatsapp_opus_rtp_payload(121));
+        assert!(is_whatsapp_opus_rtp_payload(122));
         assert!(!is_whatsapp_opus_rtp_payload(96));
     }
 
@@ -917,6 +1005,154 @@ mod tests {
             VIDEO_MEDIA_FRAME_INFO_IDR,
             VIDEO_MEDIA_FRAME_INFO_DELTA | 0x08
         );
+    }
+
+    /// A video header as WhatsApp's sender writes it when the packet carries an audio packet: the
+    /// four elements the Android capture has, with the `AP` element (id 7, two bytes) among them.
+    fn video_header_with_piggyback(offset: u16, padded: bool) -> Vec<u8> {
+        let [high, low] = offset.to_be_bytes();
+        let mut header = vec![
+            if padded { 0xb0 } else { 0x90 },
+            0xe1,
+            0,
+            7,
+            0,
+            0x02,
+            0x2e,
+            0xa2,
+            0x9b,
+            0x19,
+            0x59,
+            0xf0,
+            0xde,
+            0xbe,
+            0,
+            4,
+        ];
+        header.extend([
+            0x30, 0x01, 0x51, 0, 0, 0x61, 0, 0x24, 0x71, high, low, 0x91, 0x0a, 0x6a, 0, 0,
+        ]);
+        header
+    }
+
+    #[test]
+    fn the_audio_piggyback_offset_is_read_among_the_other_video_elements() {
+        let header = video_header_with_piggyback(321, false);
+        assert_eq!(parse_whatsapp_audio_piggyback_offset(&header), Some(321));
+        // Its presence takes the packet out of the exact four-element shape, which is what the
+        // frame-info reader exists for: it still finds the rotation.
+        assert_eq!(parse_whatsapp_video_extension(&header), None);
+        assert_eq!(parse_whatsapp_media_frame_info(&header), Some(0x01));
+
+        let captured =
+            hex::decode(kats()["rtp"]["androidVideoDeltaHeader28"].as_str().unwrap()).expect("hex");
+        assert_eq!(
+            parse_whatsapp_audio_piggyback_offset(&captured),
+            None,
+            "a video packet with no audio in it says so"
+        );
+    }
+
+    #[test]
+    fn only_a_well_formed_piggyback_element_is_believed() {
+        // RFC 8285's own profile is read the same way.
+        let mut rfc = video_header_with_piggyback(40, false);
+        rfc[12..14].copy_from_slice(&RFC8285_ONE_BYTE_EXTENSION_PROFILE.to_be_bytes());
+        assert_eq!(parse_whatsapp_audio_piggyback_offset(&rfc), Some(40));
+
+        // Any other profile is someone else's extension.
+        let mut other = video_header_with_piggyback(40, false);
+        other[12..14].copy_from_slice(&0x1000u16.to_be_bytes());
+        assert_eq!(parse_whatsapp_audio_piggyback_offset(&other), None);
+
+        // Id 7 with a length other than two bytes is not the piggyback element.
+        let mut wrong_length = video_header_with_piggyback(40, false);
+        wrong_length[24] = 0x72;
+        assert_eq!(parse_whatsapp_audio_piggyback_offset(&wrong_length), None);
+
+        // The reserved id 15 ends the element list before the piggyback element is reached.
+        let mut stopped = video_header_with_piggyback(40, false);
+        stopped[21] = 0xf0;
+        assert_eq!(parse_whatsapp_audio_piggyback_offset(&stopped), None);
+
+        // No extension at all.
+        let bare = [0x80, 0xe1, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1];
+        assert_eq!(parse_whatsapp_audio_piggyback_offset(&bare), None);
+    }
+
+    #[test]
+    fn a_piggybacked_audio_packet_is_split_off_the_media_it_rode_with() {
+        let header = video_header_with_piggyback(5, false);
+        let media = [0x41, 1, 2, 3, 4];
+        let audio = [
+            0x80, 0xfa, 0, 9, 0, 0, 0x21, 0xc0, 0x12, 0x34, 0x56, 0x78, 0x50, 7, 7,
+        ];
+        let mut payload = [media.as_slice(), audio.as_slice()].concat();
+        assert_eq!(
+            split_whatsapp_audio_piggyback(&header, &mut payload).as_deref(),
+            Some(audio.as_slice())
+        );
+        assert_eq!(
+            payload, media,
+            "only the media is left for the depacketizer"
+        );
+
+        // An offset that leaves nothing behind it, or none at all, splits nothing.
+        for offset in [0u16, 20, 21] {
+            let header = video_header_with_piggyback(offset, false);
+            let mut payload = [media.as_slice(), audio.as_slice()].concat();
+            assert_eq!(split_whatsapp_audio_piggyback(&header, &mut payload), None);
+            assert_eq!(payload.len(), media.len() + audio.len());
+        }
+    }
+
+    #[test]
+    fn padding_belongs_to_the_media_part_of_a_piggybacked_packet() {
+        // P set: the sender's stack strips the count in the last byte of the media part, which
+        // precedes the audio rather than ending the packet.
+        let header = video_header_with_piggyback(7, true);
+        let mut payload = vec![0x41, 1, 2, 3, 0, 0, 3];
+        let audio = vec![
+            0x80, 0xfa, 0, 9, 0, 0, 0x21, 0xc0, 0x12, 0x34, 0x56, 0x78, 0x50,
+        ];
+        payload.extend_from_slice(&audio);
+        assert_eq!(
+            split_whatsapp_audio_piggyback(&header, &mut payload),
+            Some(audio)
+        );
+        assert_eq!(payload, [0x41, 1, 2, 3]);
+    }
+
+    #[test]
+    fn a_plain_rtp_payload_skips_the_header_extension_and_padding() {
+        // The 16-byte speech header: fixed header plus an empty 0xdebe block.
+        let mut packet = encode_rtp_header(&RtpHeader {
+            marker: false,
+            payload_type: RTP_PAYLOAD_TYPE_MLOW_SEPARATE,
+            sequence_number: 9,
+            timestamp: 960,
+            ssrc: 0x1234_5678,
+            extension_word: None,
+            video_extension: None,
+        });
+        assert_eq!(packet.len(), WHATSAPP_RTP_HEADER_SIZE);
+        packet.extend([0x50, 1, 2]);
+        assert_eq!(plain_rtp_payload(&packet), Some([0x50, 1, 2].as_slice()));
+
+        packet[0] |= 0x20;
+        packet.extend([0, 2]);
+        assert_eq!(plain_rtp_payload(&packet), Some([0x50, 1, 2].as_slice()));
+
+        let header_only = encode_rtp_header(&RtpHeader {
+            marker: false,
+            payload_type: RTP_PAYLOAD_TYPE_MLOW,
+            sequence_number: 1,
+            timestamp: 0,
+            ssrc: 1,
+            extension_word: None,
+            video_extension: None,
+        });
+        assert_eq!(plain_rtp_payload(&header_only), None);
     }
 
     #[test]

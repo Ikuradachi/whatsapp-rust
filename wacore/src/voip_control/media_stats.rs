@@ -333,6 +333,20 @@ fn window_delta(now: &CallMediaStats, then: &CallMediaStats) -> CallMediaStats {
         // NOT a delta: the flap limit is a property of the whole call, and a probe that has latched
         // stays latched. Resetting it per window would let a thrashing call look settled.
         codec_switches: now.codec_switches,
+        video_rtp_received: now
+            .video_rtp_received
+            .saturating_sub(then.video_rtp_received),
+        video_srtp_unprotect_failed: now
+            .video_srtp_unprotect_failed
+            .saturating_sub(then.video_srtp_unprotect_failed),
+        piggybacked_audio_received: now
+            .piggybacked_audio_received
+            .saturating_sub(then.piggybacked_audio_received),
+        auxiliary_rtp_authenticated: now
+            .auxiliary_rtp_authenticated
+            .saturating_sub(then.auxiliary_rtp_authenticated),
+        // NOT a delta either: it names a type, it does not count one.
+        last_unexpected_payload_type: now.last_unexpected_payload_type,
     }
 }
 

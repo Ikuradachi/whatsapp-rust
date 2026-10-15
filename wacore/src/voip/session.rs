@@ -198,6 +198,20 @@ impl SrtpRecvStreams {
         let (_, roc, replay) = self.overflow.last_mut().expect("just pushed");
         Some((roc, replay))
     }
+
+    /// Accept an AUTHENTICATED packet's `(ssrc, seq)` at the rollover counter `roc` estimated for
+    /// it: `false` for a replay, or once the stream cap is reached. On acceptance the counter
+    /// advances, so the next packet of the stream is estimated from this one.
+    fn accept(&mut self, ssrc: u32, seq: u16, roc: u32) -> bool {
+        let Some((recv_roc, recv_replay)) = self.commit_mut(ssrc) else {
+            return false;
+        };
+        if !recv_replay.accept((u64::from(roc) << 16) | u64::from(seq)) {
+            return false;
+        }
+        recv_roc.commit_roc(roc, seq);
+        true
+    }
 }
 
 #[derive(Default)]
@@ -343,6 +357,13 @@ pub struct MediaPipeline {
     rtp: RtpStream,
     send_roc: RocTracker,
     recv_streams: SrtpRecvStreams,
+    /// Rollover and replay state for the peer's other streams under the same keys: its video FEC,
+    /// retransmission and app-data packets, which the audio profile does not decode but which can
+    /// carry its audio piggybacked. Kept apart from `recv_streams` so they cannot take a slot an
+    /// audio stream needs.
+    aux_recv_streams: SrtpRecvStreams,
+    /// Video receive state before a plane exists, transferred by [`VideoPipeline::adopt_recv_state`].
+    video_recv_streams: SrtpRecvStreams,
     srtcp: SrtcpSender,
     recv_srtcp_keys: E2eSrtpKeys,
     recv_srtcp_replay: SrtcpReplayState,
@@ -397,6 +418,8 @@ impl MediaPipeline {
             rtp: RtpStream::new(p.ssrc, p.samples_per_packet, false),
             send_roc: RocTracker::default(),
             recv_streams: SrtpRecvStreams::default(),
+            aux_recv_streams: SrtpRecvStreams::default(),
+            video_recv_streams: SrtpRecvStreams::default(),
             srtcp: SrtcpSender::new(p.call_key, p.self_lid, rtcp_cname, false)?,
             recv_srtcp_keys: derive_srtcp_keys(
                 p.call_key,
@@ -457,6 +480,8 @@ impl MediaPipeline {
         self.recv_keys = keys;
         self.recv_srtcp_keys = srtcp_keys;
         self.recv_streams = SrtpRecvStreams::default();
+        self.aux_recv_streams = SrtpRecvStreams::default();
+        self.video_recv_streams = SrtpRecvStreams::default();
         self.recv_srtcp_replay = SrtcpReplayState::default();
         true
     }
@@ -523,9 +548,68 @@ impl MediaPipeline {
     /// into the rollover counter and permanently desync the receiver (RFC 3711
     /// §3.3.1 requires the index update to follow authentication).
     pub fn unprotect_audio(&mut self, packet: &[u8]) -> Option<(RtpHeader, Vec<u8>)> {
-        unprotect_srtp_packet(
+        self.unprotect_audio_checked(packet).ok()
+    }
+
+    pub(crate) fn unprotect_audio_checked(
+        &mut self,
+        packet: &[u8],
+    ) -> Result<(RtpHeader, Vec<u8>), SrtpReceiveError> {
+        unprotect_srtp_packet_checked(
             &self.recv_keys,
             &mut self.recv_streams,
+            self.warp_mi_tag_len,
+            packet,
+        )
+    }
+
+    /// Accept an audio packet the peer carried inside another of its packets, which authenticated
+    /// as a whole: the same replay and rollover state as [`Self::unprotect_audio`], keyed by the
+    /// carried packet's own SSRC and sequence number.
+    ///
+    /// `false` for audio already accepted, standalone or carried. A peer can send the same audio
+    /// packet in more than one carrier, and every copy past the first would be decoded again. And
+    /// the rollover counter follows the carried audio, so standalone audio after a wrap that only
+    /// carried packets saw is still read at the counter it was protected with.
+    pub(crate) fn accept_carried_audio(&mut self, header: &RtpHeader) -> bool {
+        let roc = self
+            .recv_streams
+            .estimate_roc(header.ssrc, header.sequence_number);
+        // There is no inner tag to reject a guessed index before the local origin.
+        // Committing it would put the replay maximum near 2^48 and reject later audio.
+        if roc == u32::MAX {
+            return false;
+        }
+        self.recv_streams
+            .accept(header.ssrc, header.sequence_number, roc)
+    }
+
+    /// Authenticate and decrypt one of the peer's packets that is not audio for this pipeline: a
+    /// packet on its FEC, retransmission or app-data streams. Same keys and tag as the audio, which
+    /// is what the peer protects all of its streams with, but its own per-SSRC replay state.
+    ///
+    /// The point is the audio such a packet can carry piggybacked; the caller splits it off.
+    pub(crate) fn unprotect_auxiliary(
+        &mut self,
+        packet: &[u8],
+    ) -> Result<(RtpHeader, Vec<u8>), SrtpReceiveError> {
+        unprotect_srtp_packet_checked(
+            &self.recv_keys,
+            &mut self.aux_recv_streams,
+            self.warp_mi_tag_len,
+            packet,
+        )
+    }
+
+    /// Authenticate and decrypt one of the peer's video packets while the call has no video plane,
+    /// for the audio it carries.
+    pub(crate) fn unprotect_video_without_plane(
+        &mut self,
+        packet: &[u8],
+    ) -> Result<(RtpHeader, Vec<u8>), SrtpReceiveError> {
+        unprotect_srtp_packet_checked(
+            &self.recv_keys,
+            &mut self.video_recv_streams,
             self.warp_mi_tag_len,
             packet,
         )
@@ -568,27 +652,35 @@ fn protect_srtp_packet(
     packet
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum SrtpReceiveError {
+    InvalidPacket,
+    AuthenticationFailed,
+    /// Replay window or stream capacity rejected an authenticated packet.
+    Rejected,
+}
+
 /// Shared inbound SRTP step for the audio and video pipelines: verify the WARP
 /// MI tag against the *estimated* ROC BEFORE committing it, then decrypt. The
 /// order is load-bearing (RFC 3711 §3.3.1): an on-path relay must not be able
 /// to fold unauthenticated packets into the rollover counter and permanently
 /// desync the receiver.
-fn unprotect_srtp_packet(
+fn unprotect_srtp_packet_checked(
     recv_keys: &E2eSrtpKeys,
     recv_streams: &mut SrtpRecvStreams,
     warp_mi_tag_len: usize,
     packet: &[u8],
-) -> Option<(RtpHeader, Vec<u8>)> {
+) -> Result<(RtpHeader, Vec<u8>), SrtpReceiveError> {
     if packet.len() < RTP_FIXED_HEADER_LEN + warp_mi_tag_len {
-        return None;
+        return Err(SrtpReceiveError::InvalidPacket);
     }
     let split = packet.len() - warp_mi_tag_len;
     let without_tag = &packet[..split];
     let received_tag = &packet[split..];
-    let header = parse_rtp_header(without_tag)?;
-    let header_len = rtp_header_byte_length(without_tag)?;
+    let header = parse_rtp_header(without_tag).ok_or(SrtpReceiveError::InvalidPacket)?;
+    let header_len = rtp_header_byte_length(without_tag).ok_or(SrtpReceiveError::InvalidPacket)?;
     if without_tag.len() <= header_len {
-        return None;
+        return Err(SrtpReceiveError::InvalidPacket);
     }
     // Estimate against this SSRC's own counter without allocating for it. The SSRC is read from the
     // unauthenticated header, so committing state before the tag verifies would let anyone able to
@@ -601,18 +693,15 @@ fn unprotect_srtp_packet(
         warp_mi_tag_len,
         received_tag,
     ) {
-        return None;
+        return Err(SrtpReceiveError::AuthenticationFailed);
     }
     // Authenticated: only now is it safe to allocate state for this SSRC and advance its counter.
-    let (recv_roc, recv_replay) = recv_streams.commit_mut(header.ssrc)?;
-    let index = (u64::from(roc) << 16) | u64::from(header.sequence_number);
-    if !recv_replay.accept(index) {
-        return None;
+    if !recv_streams.accept(header.ssrc, header.sequence_number, roc) {
+        return Err(SrtpReceiveError::Rejected);
     }
-    recv_roc.commit_roc(roc, header.sequence_number);
     let cipher = &without_tag[header_len..];
     let plain = crypt_payload(recv_keys, header.ssrc, header.sequence_number, roc, cipher);
-    Some((header, plain))
+    Ok((header, plain))
 }
 
 /// Video sibling of [`MediaPipeline`]: same E2E-SRTP keys (per participant, not
@@ -621,6 +710,8 @@ fn unprotect_srtp_packet(
 /// reassembled from them on receive.
 type TimestampedAccessUnit = (u32, Vec<u8>, Option<u8>);
 type VideoPacketResult = (RtpHeader, Vec<TimestampedAccessUnit>);
+/// [`VideoPacketResult`] plus the audio packet the video packet carried piggybacked, if any.
+type VideoPacketSplit = (RtpHeader, Vec<TimestampedAccessUnit>, Option<Vec<u8>>);
 
 pub struct VideoPipeline {
     send_keys: E2eSrtpKeys,
@@ -897,13 +988,55 @@ impl VideoPipeline {
         )
     }
 
+    /// Transfer video receive state collected before a plane existed. Starting fresh would lose
+    /// its rollover counter and replay window, rejecting carriers after a wrap and accepting old
+    /// carriers again.
+    /// Both pipelines derive their receive keys from the same participant id.
+    pub(crate) fn adopt_recv_state(&mut self, media: &mut MediaPipeline) {
+        self.recv_streams = std::mem::take(&mut media.video_recv_streams);
+    }
+
+    /// Authenticate and decrypt a video packet while the plane is inactive, for the audio it
+    /// carries, without reassembling the picture.
+    pub(crate) fn unprotect_without_picture(
+        &mut self,
+        packet: &[u8],
+    ) -> Result<(RtpHeader, Vec<u8>), SrtpReceiveError> {
+        unprotect_srtp_packet_checked(
+            &self.recv_keys,
+            &mut self.recv_streams,
+            self.warp_mi_tag_len,
+            packet,
+        )
+    }
+
     pub(crate) fn unprotect_video_packet(&mut self, packet: &[u8]) -> Option<VideoPacketResult> {
-        let (header, payload) = unprotect_srtp_packet(
+        self.unprotect_video_packet_split(packet)
+            .ok()
+            .map(|(header, completed, _)| (header, completed))
+    }
+
+    /// [`Self::unprotect_video_packet`], also handing back the audio packet the video packet
+    /// carried piggybacked (see [`WHATSAPP_RTP_EXTENSION_AUDIO_PIGGYBACK_ID`]).
+    ///
+    /// Only the video part reaches the depacketizer. Fed the whole payload, the audio would be read
+    /// as the tail of an H.264 unit, which corrupts the slice it lands on, and the audio itself is
+    /// lost: a WhatsApp client in a video call sends its speech this way whenever a video packet
+    /// is going out.
+    ///
+    /// [`WHATSAPP_RTP_EXTENSION_AUDIO_PIGGYBACK_ID`]:
+    ///     super::rtp::WHATSAPP_RTP_EXTENSION_AUDIO_PIGGYBACK_ID
+    pub(crate) fn unprotect_video_packet_split(
+        &mut self,
+        packet: &[u8],
+    ) -> Result<VideoPacketSplit, SrtpReceiveError> {
+        let (header, mut payload) = unprotect_srtp_packet_checked(
             &self.recv_keys,
             &mut self.recv_streams,
             self.warp_mi_tag_len,
             packet,
         )?;
+        let piggybacked_audio = super::rtp::split_whatsapp_audio_piggyback(packet, &mut payload);
         // Counted BEFORE the grace check, and for every authenticated packet including the ones that
         // check ignores. Counting only the stream that replaced the retired one would never expire
         // the grace in the case that matters: a peer that sends one packet on a new SSRC and then
@@ -942,7 +1075,9 @@ impl VideoPipeline {
                 if self.packets_since_stream_change <= RETIRED_SSRC_GRACE_PACKETS
                     || self.retired_ssrc_run < RETIRED_SSRC_RESUME_PACKETS
                 {
-                    return Some((header, Vec::new()));
+                    // Its picture is ignored, but the audio it carries is the peer's current
+                    // audio: the audio stream does not change with the video SSRC.
+                    return Ok((header, Vec::new(), piggybacked_audio));
                 }
             }
             if self.depacketizer_ssrc.is_some() {
@@ -993,7 +1128,7 @@ impl VideoPipeline {
             completed.push((timestamp, au, orientation));
             next = self.depacketizer.pop_ready();
         }
-        Some((header, completed))
+        Ok((header, completed, piggybacked_audio))
     }
 }
 
