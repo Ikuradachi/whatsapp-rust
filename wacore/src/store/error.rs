@@ -26,8 +26,17 @@ pub enum StoreError {
     #[error("database operation error")]
     Database(#[source] Box<dyn std::error::Error + Send + Sync>),
 
-    #[error("database operation '{op}' exhausted retries")]
-    RetriesExhausted { op: String },
+    /// The backend exhausted its busy/locked contention retry budget.
+    /// This remains classified as contention by [`Self::is_database_busy_or_locked`].
+    #[error("database operation '{op}' exhausted retries after {attempts} attempts")]
+    RetriesExhausted {
+        op: String,
+        /// Total attempts, including the initial operation.
+        attempts: u32,
+        /// The last contention failure, preserved for typed inspection.
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 
     #[error("migration error")]
     Migration(#[source] Box<dyn std::error::Error + Send + Sync>),
@@ -40,24 +49,35 @@ pub enum StoreError {
 }
 
 impl StoreError {
-    /// Walks the error source chain and returns true if any layer's `Display`
-    /// indicates a SQLite busy/locked condition. Used by retry layers that
-    /// can't depend on a specific backend (Diesel, libsql, etc.) directly.
+    /// Recognizes exhausted contention retries and rejects known non-database
+    /// error variants without inspecting their messages.
     ///
-    /// Substring matching is necessary because SQLite reports BUSY/LOCKED
-    /// through `sqlite3_errmsg()` strings; the error code itself is mapped
-    /// to `Diesel::DatabaseError(Unknown, _)` (or similar) without further
-    /// discrimination.
+    /// `Database` and `Connection` carry opaque backend causes. A more specific
+    /// `StoreError` in their source chain overrides message hints. Otherwise this
+    /// compatibility fallback looks for "busy" or "locked" in opaque source
+    /// messages, ignoring case, including through nested database wrappers.
+    /// It can misclassify unrelated backend messages and cannot establish retry
+    /// safety. Backends should use the specific error variants when available.
+    /// SQLite's Diesel adapter loses BUSY/LOCKED codes, so opaque source-text
+    /// detection remains necessary there.
     pub fn is_database_busy_or_locked(&self) -> bool {
-        let mut layer: &dyn std::error::Error = self;
+        let mut layer: &(dyn std::error::Error + 'static) = self;
+        let mut text_indicates_contention = false;
         loop {
-            let s = layer.to_string().to_lowercase();
-            if s.contains("locked") || s.contains("busy") {
-                return true;
+            match layer.downcast_ref::<Self>() {
+                Some(Self::RetriesExhausted { .. }) => return true,
+                Some(Self::Database(source) | Self::Connection(source)) => {
+                    layer = source.as_ref();
+                    continue;
+                }
+                Some(_) => return false,
+                None => {}
             }
+            let message = layer.to_string().to_lowercase();
+            text_indicates_contention |= message.contains("locked") || message.contains("busy");
             match layer.source() {
                 Some(inner) => layer = inner,
-                None => return false,
+                None => return text_indicates_contention,
             }
         }
     }

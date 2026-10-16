@@ -517,6 +517,11 @@ pub(crate) struct ReadPool {
 
 /// Fixed-device storage handle implementing the open domain traits in `Backend`.
 /// Obtain siblings from [`crate::SqliteDatabase::store`] without opening new pools.
+/// Repeated SQLite busy/locked failures return [`StoreError::RetriesExhausted`]
+/// after six attempts, including the total attempt count and last Diesel cause.
+/// Other database failures retain their backend source.
+/// Exhaustion describes contention, not whether replaying a larger application
+/// operation is safe.
 /// Domain operations do not accept a second account id:
 ///
 /// ```compile_fail
@@ -1595,7 +1600,8 @@ impl SqliteStore {
     {
         const MAX_RETRIES: u32 = 5;
 
-        for attempt in 0..=MAX_RETRIES {
+        let mut attempt = 0;
+        loop {
             let permit = self
                 .db_semaphore
                 .clone()
@@ -1628,10 +1634,15 @@ impl SqliteStore {
                     barrier?;
                     return Ok(val);
                 }
-                Ok((Err(DieselOrStore::Diesel(ref e)), permit))
-                    if is_retriable_sqlite_error(e) && attempt < MAX_RETRIES =>
-                {
+                Ok((Err(DieselOrStore::Diesel(e)), permit)) if is_retriable_sqlite_error(&e) => {
                     drop(permit);
+                    if attempt == MAX_RETRIES {
+                        return Err(StoreError::RetriesExhausted {
+                            op: op_name.to_string(),
+                            attempts: attempt + 1,
+                            source: Box::new(e),
+                        });
+                    }
                     let delay_ms = 10u64 * (1u64 << attempt.min(4));
                     // Skip the first transient blip; warn from the second retry on so
                     // sustained busy/locked contention doesn't go unobserved.
@@ -1643,6 +1654,7 @@ impl SqliteStore {
                         );
                     }
                     retry_backoff(delay_ms).await;
+                    attempt += 1;
                 }
                 Ok((Err(e), permit)) => {
                     drop(permit);
@@ -1651,10 +1663,6 @@ impl SqliteStore {
                 Err(e) => return Err(StoreError::Database(Box::new(e))),
             }
         }
-
-        Err(StoreError::RetriesExhausted {
-            op: op_name.to_string(),
-        })
     }
 
     fn serialize_keypair(&self, key_pair: &KeyPair) -> Result<Vec<u8>> {
@@ -5199,16 +5207,36 @@ mod tests {
             let observed = attempts.clone();
             let result = store
                 .with_retry("bounded_retry", move || {
-                    observed.fetch_add(1, Ordering::SeqCst);
+                    let attempt = observed.fetch_add(1, Ordering::SeqCst) + 1;
                     Box::new(move |_| -> std::result::Result<(), DieselError> {
                         Err(DieselError::DatabaseError(
                             DatabaseErrorKind::Unknown,
-                            Box::new(message.to_string()),
+                            Box::new(format!("{message}, attempt {attempt}")),
                         ))
                     })
                 })
                 .await;
-            assert!(result.is_err());
+            match (expected_attempts, result) {
+                (
+                    6,
+                    Err(StoreError::RetriesExhausted {
+                        op,
+                        attempts,
+                        source,
+                    }),
+                ) => {
+                    assert_eq!(op, "bounded_retry");
+                    assert_eq!(attempts, 6);
+                    let last = source
+                        .downcast_ref::<DieselError>()
+                        .expect("last Diesel cause");
+                    assert!(
+                        matches!(last, DieselError::DatabaseError(DatabaseErrorKind::Unknown, info) if info.message() == format!("{message}, attempt {expected_attempts}"))
+                    );
+                }
+                (1, Err(StoreError::Database(_))) => {}
+                (_, result) => panic!("unexpected retry classification: {result:?}"),
+            }
             assert_eq!(attempts.load(Ordering::SeqCst), expected_attempts);
             assert_eq!(store.db_semaphore.available_permits(), 1);
         }
