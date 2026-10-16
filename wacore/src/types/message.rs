@@ -1,3 +1,18 @@
+//! Message metadata and envelope types.
+//!
+//! Open envelope enums can gain named variants. Keep `_` even when handling
+//! `Unknown` explicitly; adding a named wire value must not break consumers.
+//! ```compile_fail,E0004
+//! use wacore::types::message::StanzaMessageType as T;
+//! fn known(value: T) -> bool {
+//!     match value {
+//!         T::Text | T::Media | T::MediaNotify | T::Pay | T::Poll
+//!         | T::Reaction | T::Event => true,
+//!         T::Unknown(_) => false,
+//!     }
+//! }
+//! ```
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use wacore_binary::{CompactString, Jid, JidExt, MessageId, MessageServerId};
