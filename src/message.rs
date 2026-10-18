@@ -171,6 +171,9 @@ pub(crate) struct ClassifiedMessage {
     pub bot_payloads: Vec<EncPayload>,
     pub max_sender_retry_count: u8,
     pub decrypt_fail_mode: crate::types::events::DecryptFailMode,
+    /// Stanza `recipient` the parser left off `info` (non-own branches); the
+    /// server rejects a transport ack that omits it with `<stream:error><ack/>`.
+    pub ack_recipient: Option<Jid>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]

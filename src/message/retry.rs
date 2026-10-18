@@ -49,6 +49,7 @@ impl Client {
             &info,
             options,
             (max_sender_retry_count > 0).then_some(max_sender_retry_count),
+            false,
         )
         .await
     }
@@ -229,6 +230,7 @@ impl Client {
         info: &Arc<MessageInfo>,
         reason: RetryReason,
         decrypt_fail_mode: crate::types::events::DecryptFailMode,
+        ack_recipient: Option<&Jid>,
     ) -> bool {
         self.dispatch_undecryptable_event(
             Arc::clone(info),
@@ -239,6 +241,7 @@ impl Client {
         .await;
         let client = Arc::clone(self);
         let info = Arc::clone(info);
+        let ack_recipient = ack_recipient.cloned();
         self.outbound_flush.spawn(&*self.runtime, async move {
             // A self-fanout is our own message; retrying it to ourselves is
             // futile and the server's offline queue ignores a bare transport
@@ -260,7 +263,9 @@ impl Client {
                 .run_retry_receipt(&info, reason, decrypt_fail_mode)
                 .await;
             if resend_sent {
-                client.send_transport_ack(&info).await;
+                client
+                    .send_transport_ack(&info, ack_recipient.as_ref())
+                    .await;
             }
         });
         true
@@ -386,6 +391,7 @@ impl Client {
         info: &Arc<MessageInfo>,
         options: crate::features::RetryRequestOptions,
         sender_retry_count: Option<u8>,
+        automatic: bool,
     ) -> Result<crate::features::RetryRequestOutcome, crate::features::RetryRequestError> {
         let reason = options.reason();
         let cache_key = self
@@ -418,6 +424,28 @@ impl Client {
                 info.source.sender.observe(),
                 reason
             );
+        }
+
+        // Opt-in volume bound on automatic retries: the per-message cap above
+        // does not bound a broken sender's aggregate. Gated after the cap so
+        // capped redeliveries never spend admission budget; a refusal returns
+        // Ok so the caller still acks and the server stops redelivering.
+        if automatic
+            && !info.source.is_from_me
+            && !crate::retry::retry_receipt_always_suppressed(info)
+            && let Some(policy) = self.decrypt_failure_admission.get()
+            && !policy.admit(&info.source.chat, &info.source.sender)
+        {
+            debug!(
+                "[msg:{}] retry receipt to {} in {} dropped by DecryptFailureAdmission policy",
+                info.id,
+                info.source.sender.observe(),
+                info.source.chat.observe()
+            );
+            if retry_count == 1 {
+                self.run_pdo_request(info).await;
+            }
+            return Ok(crate::features::RetryRequestOutcome::Suppressed { retry_count });
         }
 
         let send_result = self
@@ -473,7 +501,7 @@ impl Client {
     /// to retry but the send failed (so the stanza stays queued for another try),
     /// `true` when the resend went out or we deliberately gave up at the cap.
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.recv.retry_receipt", level = "debug", skip_all, fields(chat = %info.source.chat.observe(), sender = %info.source.sender.observe(), msg_id = %info.id, reason = ?reason)))]
-    async fn run_retry_receipt(
+    pub(crate) async fn run_retry_receipt(
         self: &Arc<Self>,
         info: &Arc<MessageInfo>,
         reason: RetryReason,
@@ -486,6 +514,7 @@ impl Client {
                     .with_reason(reason)
                     .with_decrypt_fail_mode(decrypt_fail_mode),
                 None,
+                true,
             )
             .await
         {

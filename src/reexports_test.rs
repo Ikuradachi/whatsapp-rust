@@ -91,3 +91,17 @@ fn bytes_and_chrono_reexports_are_usable() {
     let _ts: whatsapp_rust::chrono::DateTime<whatsapp_rust::chrono::Utc> =
         whatsapp_rust::wacore::time::now_utc();
 }
+
+struct AdmitAllDecryptFailures;
+
+impl whatsapp_rust::DecryptFailureAdmission for AdmitAllDecryptFailures {
+    fn admit(&self, _chat: &whatsapp_rust::Jid, _sender: &whatsapp_rust::Jid) -> bool {
+        true
+    }
+}
+
+#[test]
+fn decrypt_failure_admission_is_object_safe_and_constructible() {
+    let policy: Box<dyn whatsapp_rust::DecryptFailureAdmission> = Box::new(AdmitAllDecryptFailures);
+    let _ = &policy;
+}

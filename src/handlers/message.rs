@@ -560,6 +560,7 @@ mod tests {
             bot_payloads: Vec::new(),
             max_sender_retry_count: 0,
             decrypt_fail_mode: crate::types::events::DecryptFailMode::default(),
+            ack_recipient: None,
         };
         let process_classified_fut =
             Arc::clone(&client).process_classified_message(dummy_classified, 0);

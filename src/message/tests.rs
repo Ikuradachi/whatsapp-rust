@@ -5140,7 +5140,12 @@ async fn test_undecryptable_fires_before_retry_task() {
     );
 
     let _ = client
-        .handle_decrypt_failure(&info, RetryReason::InvalidKeyId, DecryptFailMode::Show)
+        .handle_decrypt_failure(
+            &info,
+            RetryReason::InvalidKeyId,
+            DecryptFailMode::Show,
+            None,
+        )
         .await;
 
     assert_eq!(
@@ -5190,7 +5195,7 @@ async fn test_undecryptable_dedup_is_atomic() {
         let c = Arc::clone(&client);
         let i = Arc::clone(&info);
         handles.push(tokio::spawn(async move {
-            c.handle_decrypt_failure(&i, RetryReason::InvalidKeyId, DecryptFailMode::Show)
+            c.handle_decrypt_failure(&i, RetryReason::InvalidKeyId, DecryptFailMode::Show, None)
                 .await;
         }));
     }
@@ -5220,10 +5225,20 @@ async fn test_undecryptable_deduped_across_resends() {
     ));
 
     let _ = client
-        .handle_decrypt_failure(&info, RetryReason::InvalidKeyId, DecryptFailMode::Show)
+        .handle_decrypt_failure(
+            &info,
+            RetryReason::InvalidKeyId,
+            DecryptFailMode::Show,
+            None,
+        )
         .await;
     let _ = client
-        .handle_decrypt_failure(&info, RetryReason::InvalidKeyId, DecryptFailMode::Show)
+        .handle_decrypt_failure(
+            &info,
+            RetryReason::InvalidKeyId,
+            DecryptFailMode::Show,
+            None,
+        )
         .await;
 
     let events = recorder.undecryptable();
@@ -5323,6 +5338,7 @@ async fn undecryptable_receive_branch_stays_silent_when_batch_dispatched() {
                 bot_payloads: vec![],
                 max_sender_retry_count: 0,
                 decrypt_fail_mode: DecryptFailMode::Show,
+                ack_recipient: None,
             },
             client.connection_generation.load(Ordering::Acquire),
         )
@@ -5398,6 +5414,7 @@ async fn undecryptable_receive_branch_announces_the_dispatch_it_performs() {
                 bot_payloads: vec![],
                 max_sender_retry_count: 0,
                 decrypt_fail_mode: DecryptFailMode::Show,
+                ack_recipient: None,
             },
             client.connection_generation.load(Ordering::Acquire),
         )
@@ -7377,7 +7394,7 @@ async fn decrypt_failure_emits_transport_ack() {
     });
 
     client
-        .handle_decrypt_failure(&info, RetryReason::BadMac, DecryptFailMode::Hide)
+        .handle_decrypt_failure(&info, RetryReason::BadMac, DecryptFailMode::Hide, None)
         .await;
 
     // retry + ack are detached spawns; poll the wire until the ack appears.
@@ -7426,7 +7443,7 @@ async fn self_fanout_decrypt_failure_acked_via_sender_receipt() {
     });
 
     client
-        .handle_decrypt_failure(&info, RetryReason::BadMac, DecryptFailMode::Hide)
+        .handle_decrypt_failure(&info, RetryReason::BadMac, DecryptFailMode::Hide, None)
         .await;
 
     let mut found = None;
@@ -7488,7 +7505,7 @@ async fn bot_author_self_fanout_decrypt_failure_not_sender_receipt() {
     });
 
     client
-        .handle_decrypt_failure(&info, RetryReason::BadMac, DecryptFailMode::Hide)
+        .handle_decrypt_failure(&info, RetryReason::BadMac, DecryptFailMode::Hide, None)
         .await;
 
     // Positive: the message IS cleared, via the bot-invoke-response bare
@@ -7536,7 +7553,7 @@ async fn decrypt_failure_does_not_ack_when_retry_send_fails() {
     });
     transport.fail_next_sends(1);
     client
-        .handle_decrypt_failure(&info, RetryReason::BadMac, DecryptFailMode::Show)
+        .handle_decrypt_failure(&info, RetryReason::BadMac, DecryptFailMode::Show, None)
         .await;
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         while transport.failed_sends() == 0 {
@@ -7570,7 +7587,7 @@ async fn decrypt_failure_sends_retry_before_ack() {
     // BadMac (not NoSession) so the retry receipt carries no keys and needs
     // no device account in this harness.
     client
-        .handle_decrypt_failure(&info, RetryReason::BadMac, DecryptFailMode::Show)
+        .handle_decrypt_failure(&info, RetryReason::BadMac, DecryptFailMode::Show, None)
         .await;
 
     let find = |tag: &str, retry: bool| -> Option<usize> {
@@ -7627,7 +7644,7 @@ async fn status_broadcast_decrypt_failure_acks_to_chat() {
     });
 
     client
-        .handle_decrypt_failure(&info, RetryReason::BadMac, DecryptFailMode::Show)
+        .handle_decrypt_failure(&info, RetryReason::BadMac, DecryptFailMode::Show, None)
         .await;
 
     // status failures are acked from the flushed task (not just the detached
@@ -7686,6 +7703,7 @@ async fn process_session_ct(
                 bot_payloads: vec![],
                 max_sender_retry_count: 0,
                 decrypt_fail_mode: DecryptFailMode::Show,
+                ack_recipient: None,
             },
             client.connection_generation.load(Ordering::Acquire),
         )
@@ -7789,6 +7807,7 @@ async fn process_group_classified_with_payloads(
                 bot_payloads,
                 max_sender_retry_count: 0,
                 decrypt_fail_mode: DecryptFailMode::Show,
+                ack_recipient: None,
             },
             client.connection_generation.load(Ordering::Acquire),
         )
@@ -15110,6 +15129,7 @@ async fn a_group_enc_without_a_sender_key_reports_no_sender_key() {
                 bot_payloads: vec![],
                 max_sender_retry_count: 0,
                 decrypt_fail_mode: DecryptFailMode::Show,
+                ack_recipient: None,
             },
             client.connection_generation.load(Ordering::Acquire),
         )
@@ -15158,6 +15178,7 @@ async fn a_skmsg_skipped_after_a_session_failure_reports_not_attempted() {
                 bot_payloads: vec![],
                 max_sender_retry_count: 0,
                 decrypt_fail_mode: DecryptFailMode::Show,
+                ack_recipient: None,
             },
             client.connection_generation.load(Ordering::Acquire),
         )
@@ -15214,6 +15235,7 @@ async fn session_encs_from_a_group_sender_report_not_attempted() {
                 bot_payloads: vec![],
                 max_sender_retry_count: 0,
                 decrypt_fail_mode: DecryptFailMode::Show,
+                ack_recipient: None,
             },
             client.connection_generation.load(Ordering::Acquire),
         )
@@ -15499,6 +15521,7 @@ async fn a_group_envelope_that_does_not_parse_reports_malformed_ciphertext() {
                 bot_payloads: vec![],
                 max_sender_retry_count: 0,
                 decrypt_fail_mode: DecryptFailMode::Show,
+                ack_recipient: None,
             },
             client.connection_generation.load(Ordering::Acquire),
         )
@@ -15651,6 +15674,7 @@ async fn a_stanza_abandoned_by_a_teardown_reports_what_it_never_tried() {
                 bot_payloads: vec![],
                 max_sender_retry_count: 0,
                 decrypt_fail_mode: DecryptFailMode::Show,
+                ack_recipient: None,
             },
             stale_generation,
         )
@@ -15754,6 +15778,7 @@ async fn a_skmsg_skipped_beside_a_duplicate_is_still_reported() {
                 bot_payloads: vec![],
                 max_sender_retry_count: 0,
                 decrypt_fail_mode: DecryptFailMode::Show,
+                ack_recipient: None,
             },
             client.connection_generation.load(Ordering::Acquire),
         )
@@ -20467,6 +20492,7 @@ async fn raw_pending_real_stanza_failure_cannot_ack_successful_predecessor() {
                 bot_payloads: vec![],
                 max_sender_retry_count: 0,
                 decrypt_fail_mode: DecryptFailMode::Show,
+                ack_recipient: None,
             },
             client.connection_generation.load(Ordering::Acquire),
         )
@@ -22820,5 +22846,306 @@ fn session_store_encoding_does_not_rebuild_skipped_key_arrays() {
     assert!(
         max <= 1024,
         "store encoding allocated a {max}-byte temporary"
+    );
+}
+
+struct FixedDecryptFailureAdmission {
+    verdict: bool,
+    calls: std::sync::Mutex<Vec<(Jid, Jid)>>,
+}
+
+impl crate::DecryptFailureAdmission for FixedDecryptFailureAdmission {
+    fn admit(&self, chat: &Jid, sender: &Jid) -> bool {
+        self.calls
+            .lock()
+            .expect("calls lock")
+            .push((chat.clone(), sender.clone()));
+        self.verdict
+    }
+}
+
+struct DecryptFailureOutcome {
+    retry_sent: bool,
+    ack_sent: bool,
+    undecryptable_events: usize,
+    policy_calls: Vec<(Jid, Jid)>,
+}
+
+/// Runs one decrypt failure with an optional fixed-verdict policy and reports
+/// what reached the wire once the transport ack (always sent here) is out.
+async fn run_decrypt_failure_with_policy(
+    test_id: &str,
+    verdict: Option<bool>,
+    is_from_me: bool,
+) -> DecryptFailureOutcome {
+    let (client, transport) = capturing_client(test_id).await;
+    let recorder = Arc::new(EventRecorder::default());
+    client.subscribe_handler(recorder.clone()).detach();
+    let policy = verdict.map(|verdict| {
+        let policy = Arc::new(FixedDecryptFailureAdmission {
+            verdict,
+            calls: std::sync::Mutex::new(Vec::new()),
+        });
+        assert!(client.set_decrypt_failure_admission(policy.clone()));
+        policy
+    });
+
+    let sender: Jid = "5511777776666@s.whatsapp.net".parse().expect("sender");
+    let info = Arc::new(MessageInfo {
+        id: format!("DFA{test_id}").into(),
+        source: crate::types::message::MessageSource {
+            sender: sender.clone(),
+            chat: sender.clone(),
+            is_from_me,
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    // BadMac so the retry receipt carries no keys (no device account needed).
+    client
+        .handle_decrypt_failure(&info, RetryReason::BadMac, DecryptFailMode::Show, None)
+        .await;
+
+    let retry_sent = |frames: &[bytes::Bytes]| {
+        frames.iter().enumerate().any(|(i, frame)| {
+            decode_frame(i, frame).is_some_and(|buf| {
+                wacore_binary::marshal::unmarshal_packed_ref(&buf).is_ok_and(|node| {
+                    node.tag.as_ref() == "receipt"
+                        && node.get_attr("type").is_some_and(|v| v.as_str() == "retry")
+                })
+            })
+        })
+    };
+    let mut ack_sent = false;
+    for _ in 0..80 {
+        if find_message_ack(&transport.sent()).is_some() {
+            ack_sent = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    DecryptFailureOutcome {
+        retry_sent: retry_sent(&transport.sent()),
+        ack_sent,
+        undecryptable_events: recorder.undecryptable().len(),
+        policy_calls: policy
+            .map(|p| p.calls.lock().expect("calls lock").clone())
+            .unwrap_or_default(),
+    }
+}
+
+#[tokio::test]
+async fn decrypt_failure_without_admission_policy_sends_retry_and_ack() {
+    let out = run_decrypt_failure_with_policy("dfa_none", None, false).await;
+    assert!(out.retry_sent, "default path must request a retry");
+    assert!(out.ack_sent);
+    assert_eq!(out.undecryptable_events, 1);
+}
+
+#[tokio::test]
+async fn decrypt_failure_admission_refusal_acks_without_retry() {
+    let out = run_decrypt_failure_with_policy("dfa_refuse", Some(false), false).await;
+    assert!(
+        out.ack_sent,
+        "a refused retry must still ack so the server stops redelivering"
+    );
+    assert!(!out.retry_sent, "a refused retry must not reach the wire");
+    assert_eq!(out.undecryptable_events, 1, "the event still dispatches");
+    let sender: Jid = "5511777776666@s.whatsapp.net".parse().expect("sender");
+    assert_eq!(out.policy_calls, vec![(sender.clone(), sender)]);
+}
+
+#[tokio::test]
+async fn decrypt_failure_admission_accept_keeps_default_path() {
+    let out = run_decrypt_failure_with_policy("dfa_accept", Some(true), false).await;
+    assert!(out.retry_sent);
+    assert!(out.ack_sent);
+    assert_eq!(out.undecryptable_events, 1);
+    assert_eq!(out.policy_calls.len(), 1);
+}
+
+#[tokio::test]
+async fn decrypt_failure_admission_skips_own_messages() {
+    let out = run_decrypt_failure_with_policy("dfa_own", Some(false), true).await;
+    assert!(
+        out.policy_calls.is_empty(),
+        "own messages never reach the policy"
+    );
+    assert!(out.retry_sent);
+}
+
+#[tokio::test]
+async fn decrypt_failure_admission_registers_once() {
+    let (client, _transport) = capturing_client("dfa_once").await;
+    let policy = || {
+        Arc::new(FixedDecryptFailureAdmission {
+            verdict: true,
+            calls: std::sync::Mutex::new(Vec::new()),
+        })
+    };
+    assert!(client.set_decrypt_failure_admission(policy()));
+    assert!(!client.set_decrypt_failure_admission(policy()));
+}
+
+/// The policy is consulted only while the per-message cap still allows a
+/// retry: capped redeliveries go straight to the PDO fallback without
+/// spending admission budget.
+#[tokio::test]
+async fn decrypt_failure_admission_not_consulted_past_cap() {
+    let (client, _transport) = capturing_client("dfa_cap").await;
+    let policy = Arc::new(FixedDecryptFailureAdmission {
+        verdict: false,
+        calls: std::sync::Mutex::new(Vec::new()),
+    });
+    assert!(client.set_decrypt_failure_admission(policy.clone()));
+    let sender: Jid = "5511777776666@s.whatsapp.net".parse().expect("sender");
+    let info = Arc::new(MessageInfo {
+        id: "DFACAP".into(),
+        source: crate::types::message::MessageSource {
+            sender: sender.clone(),
+            chat: sender,
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    for _ in 0..(MAX_DECRYPT_RETRIES + 2) {
+        client
+            .run_retry_receipt(&info, RetryReason::BadMac, DecryptFailMode::Show)
+            .await;
+    }
+    assert_eq!(
+        policy.calls.lock().expect("calls lock").len(),
+        usize::from(MAX_DECRYPT_RETRIES)
+    );
+}
+
+/// Another account's LID-routed stanza: the parser keeps `recipient` off
+/// `info`, so the decrypt-failure ack must take it from the stanza or the
+/// server answers `<stream:error><ack/>`. Covers the default and the refused
+/// retry paths.
+async fn decrypt_failure_ack_recipient(test_id: &str, verdict: Option<bool>) -> Option<String> {
+    use crate::types::events::DecryptFailMode;
+    let (client, transport) = capturing_client(test_id).await;
+    if let Some(verdict) = verdict {
+        assert!(
+            client.set_decrypt_failure_admission(Arc::new(FixedDecryptFailureAdmission {
+                verdict,
+                calls: std::sync::Mutex::new(Vec::new()),
+            }))
+        );
+    }
+    let sender_ratchet = KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>()).public_key;
+    let sender_identity = IdentityKeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
+    let receiver_identity = IdentityKeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
+    let signal_message = SignalMessage::new(
+        4,
+        &[0u8; 32],
+        sender_ratchet,
+        0,
+        0,
+        b"test",
+        sender_identity.identity_key(),
+        receiver_identity.identity_key(),
+    )
+    .expect("SignalMessage::new should succeed with valid inputs");
+    let node = NodeBuilder::new("message")
+        .attr("from", "236395184570386@lid")
+        .attr("recipient", "156535032389744@lid")
+        .attr("id", format!("DFAREC{test_id}"))
+        .attr("type", "text")
+        .children([NodeBuilder::new("enc")
+            .attr("type", "msg")
+            .bytes(signal_message.serialized().to_vec())
+            .build()])
+        .build();
+    let classified = client
+        .classify_incoming_message(&node_to_arc(node))
+        .await
+        .expect("a session payload reaches the process phase");
+    assert!(classified.info.source.recipient.is_none());
+    assert_eq!(classified.decrypt_fail_mode, DecryptFailMode::Show);
+    client
+        .clone()
+        .process_classified_message(
+            classified,
+            client.connection_generation.load(Ordering::Acquire),
+        )
+        .await;
+
+    for _ in 0..80 {
+        if let Some((to, recipient)) = find_message_ack(&transport.sent()) {
+            assert_eq!(to, "236395184570386@lid");
+            return recipient;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    panic!("the decrypt failure must emit a transport ack");
+}
+
+#[tokio::test]
+async fn decrypt_failure_ack_preserves_stanza_recipient() {
+    assert_eq!(
+        decrypt_failure_ack_recipient("dfa_rec_none", None)
+            .await
+            .as_deref(),
+        Some("156535032389744@lid")
+    );
+}
+
+#[tokio::test]
+async fn decrypt_failure_refused_ack_preserves_stanza_recipient() {
+    assert_eq!(
+        decrypt_failure_ack_recipient("dfa_rec_refuse", Some(false))
+            .await
+            .as_deref(),
+        Some("156535032389744@lid")
+    );
+}
+
+/// A bot reply in a non-bot group never gets a retry receipt, so it must not
+/// spend admission budget; a bot DM still retries and is still consulted.
+#[tokio::test]
+async fn decrypt_failure_admission_skips_suppressed_bot_retries() {
+    use crate::types::events::DecryptFailMode;
+    let (client, _transport) = capturing_client("dfa_bot").await;
+    let policy = Arc::new(FixedDecryptFailureAdmission {
+        verdict: true,
+        calls: std::sync::Mutex::new(Vec::new()),
+    });
+    assert!(client.set_decrypt_failure_admission(policy.clone()));
+    let bot: Jid = "200000000000002@bot".parse().expect("bot");
+    let group_bot = Arc::new(MessageInfo {
+        id: "DFABOTGRP".into(),
+        source: crate::types::message::MessageSource {
+            chat: "120363021033254949@g.us".parse().expect("group"),
+            sender: bot.clone(),
+            is_group: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    client
+        .run_retry_receipt(&group_bot, RetryReason::BadMac, DecryptFailMode::Show)
+        .await;
+    assert!(
+        policy.calls.lock().expect("calls lock").is_empty(),
+        "a suppressed bot retry must not reach the policy"
+    );
+
+    let bot_dm = Arc::new(MessageInfo {
+        id: "DFABOTDM".into(),
+        source: crate::types::message::MessageSource {
+            chat: bot.clone(),
+            sender: bot.clone(),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    client
+        .run_retry_receipt(&bot_dm, RetryReason::BadMac, DecryptFailMode::Show)
+        .await;
+    assert_eq!(
+        *policy.calls.lock().expect("calls lock"),
+        vec![(bot.clone(), bot)]
     );
 }

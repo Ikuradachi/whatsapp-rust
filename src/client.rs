@@ -2137,6 +2137,13 @@ pub struct Client {
     pub(crate) retry_admission:
         std::sync::OnceLock<Arc<dyn crate::types::retry_admission::RetryAdmission>>,
 
+    /// Optional outbound retry-receipt admission policy (see
+    /// [`crate::types::decrypt_failure_admission::DecryptFailureAdmission`]).
+    /// `None` (default) requests a retry for every decrypt failure.
+    pub(crate) decrypt_failure_admission: std::sync::OnceLock<
+        Arc<dyn crate::types::decrypt_failure_admission::DecryptFailureAdmission>,
+    >,
+
     /// Optional run-loop dial admission policy, fixed during assembly.
     pub(crate) connect_admission:
         Option<Arc<dyn crate::types::connect_admission::ConnectAdmission>>,
@@ -2539,7 +2546,10 @@ fn encode_ack_bytes(
 /// is the group for group/broadcast stanzas and the sender otherwise (sender
 /// keeps the device qualifier; `chat` is device-stripped for DMs). Mirrors
 /// whatsmeow's `sendAck` (`to`=from, copy recipient/participant).
-fn message_ack_source_node(info: &crate::types::message::MessageInfo) -> Node {
+fn message_ack_source_node(
+    info: &crate::types::message::MessageInfo,
+    recipient: Option<&Jid>,
+) -> Node {
     let from = if info.source.is_group {
         &info.source.chat
     } else {
@@ -2548,7 +2558,7 @@ fn message_ack_source_node(info: &crate::types::message::MessageInfo) -> Node {
     let mut builder = NodeBuilder::new("message")
         .attr("id", &info.id)
         .attr("from", from);
-    if let Some(recipient) = &info.source.recipient {
+    if let Some(recipient) = recipient.or(info.source.recipient.as_ref()) {
         builder = builder.attr("recipient", recipient);
     }
     if info.source.is_group {

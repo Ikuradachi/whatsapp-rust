@@ -501,6 +501,7 @@ pub use client::{
 };
 pub use client::{NodeFilter, NodeWaiter};
 pub use types::connect_admission::ConnectAdmission;
+pub use types::decrypt_failure_admission::DecryptFailureAdmission;
 pub use types::durability_hook::{HistorySyncCaptureHook, InboundDurabilityHook};
 pub use types::group_notification_durability::GroupNotificationDurabilityHook;
 pub use types::history_sync_admission::{

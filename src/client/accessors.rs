@@ -357,6 +357,21 @@ impl Client {
         self.retry_admission.set(policy).is_ok()
     }
 
+    /// Register a [`DecryptFailureAdmission`] policy: an opt-in gate that can
+    /// skip the outbound retry receipt for a message we failed to decrypt. The
+    /// stanza is still acked and `UndecryptableMessage` still dispatched. Unset
+    /// (the default) requests a retry for every failure, matching WhatsApp Web.
+    ///
+    /// Set once, before connecting; a later call is ignored and returns `false`.
+    ///
+    /// [`DecryptFailureAdmission`]: crate::types::decrypt_failure_admission::DecryptFailureAdmission
+    pub fn set_decrypt_failure_admission(
+        &self,
+        policy: Arc<dyn crate::types::decrypt_failure_admission::DecryptFailureAdmission>,
+    ) -> bool {
+        self.decrypt_failure_admission.set(policy).is_ok()
+    }
+
     /// Cumulative wire I/O and activity counters for this client session.
     ///
     /// Always available, no feature gate: recording costs one relaxed atomic

@@ -1183,8 +1183,14 @@ impl Client {
     /// Send a transport ack so the server stops replaying a stanza from the
     /// offline queue. Awaitable so callers can order it after a retry receipt
     /// in a single flushed task.
-    pub(crate) async fn send_transport_ack(&self, info: &crate::types::message::MessageInfo) {
-        let source = message_ack_source_node(info);
+    /// `recipient` overrides `info.source.recipient`, which the parser drops
+    /// on non-own branches.
+    pub(crate) async fn send_transport_ack(
+        &self,
+        info: &crate::types::message::MessageInfo,
+        recipient: Option<&Jid>,
+    ) {
+        let source = message_ack_source_node(info, recipient);
         let encoded =
             self.encode_ack_from_snapshot(&source.as_node_ref(), AckParticipantPolicy::Preserve);
         match encoded {
@@ -1208,7 +1214,7 @@ impl Client {
         let client = Arc::clone(self);
         let info = Arc::clone(info);
         self.outbound_flush.spawn(&*self.runtime, async move {
-            client.send_transport_ack(&info).await;
+            client.send_transport_ack(&info, None).await;
         });
     }
 

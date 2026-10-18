@@ -320,6 +320,15 @@ pub(crate) enum RetryReceiptSendOutcome {
     Suppressed,
 }
 
+/// Whether `send_retry_receipt` drops the receipt regardless of state. WA Web's
+/// sendRetryReceipt aborts only when `!to.isBot() && participant.isBot()`, with
+/// participant null for DMs: a bot DM (chat == sender == bot) still retries,
+/// only a bot reply in a non-bot group is dropped. Admission checks it first
+/// so a receipt that never reaches the wire spends no policy budget.
+pub(crate) fn retry_receipt_always_suppressed(info: &crate::types::message::MessageInfo) -> bool {
+    info.source.is_bot_authored_non_bot_chat()
+}
+
 /// Separated chat and requester JIDs for retry receipt handling.
 /// Mirrors WAWebHandleRetryRequest `getActualChatInfo` + `getTargetChat`.
 struct RetryChatInfo {
@@ -1814,11 +1823,7 @@ impl Client {
     ) -> Result<RetryReceiptSendOutcome, RetryRequestError> {
         let device_snapshot = self.persistence_manager.get_device_snapshot();
 
-        // WA Web's sendRetryReceipt aborts only when `!to.isBot() && participant.isBot()`,
-        // with participant null for DMs. A bot DM is chat == sender == bot, so it is NOT
-        // suppressed and the retry is sent; only a bot reply in a non-bot group is dropped.
-        // Same helper the ack and self-fanout paths already use.
-        if info.source.is_bot_authored_non_bot_chat() {
+        if retry_receipt_always_suppressed(info) {
             log::debug!(
                 "Skipping retry receipt for message {} from bot {} in non-bot chat {}",
                 info.id,

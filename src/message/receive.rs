@@ -290,6 +290,12 @@ impl Client {
         }
         let sender_encryption_jid = self.resolve_encryption_jid(&info.source.sender).await;
 
+        let ack_recipient = if info.source.recipient.is_none() {
+            nr.attrs().optional_jid("recipient")
+        } else {
+            None
+        };
+
         let unavailable_node = nr.get_optional_child("unavailable");
 
         if all_enc_nodes.is_empty() && unavailable_node.is_none() {
@@ -362,7 +368,9 @@ impl Client {
                     client.run_pdo_request(&info2).await
                 };
                 if !skip_ack && should_ack {
-                    client.send_transport_ack(&info2).await;
+                    client
+                        .send_transport_ack(&info2, ack_recipient.as_ref())
+                        .await;
                 }
             });
             return None;
@@ -526,6 +534,7 @@ impl Client {
             } else {
                 crate::types::events::DecryptFailMode::Show
             },
+            ack_recipient,
         })
     }
 
@@ -547,6 +556,7 @@ impl Client {
             bot_payloads,
             max_sender_retry_count,
             decrypt_fail_mode,
+            ack_recipient,
         } = msg;
 
         // Acquire the global processing permit (1 during offline sync, N after).
@@ -738,6 +748,7 @@ impl Client {
                     &info,
                     &sender_encryption_jid,
                     decrypt_fail_mode,
+                    ack_recipient.as_ref(),
                     stanza_origin,
                 )
                 .await
@@ -792,6 +803,7 @@ impl Client {
                         &info,
                         &sender_encryption_jid,
                         decrypt_fail_mode,
+                        ack_recipient.as_ref(),
                         stanza_origin,
                     )
                     .await
@@ -953,6 +965,7 @@ impl Client {
             info,
             sender_encryption_jid,
             decrypt_fail_mode,
+            None,
             raw_pending::StanzaOrigin::new(),
         )
         .await
@@ -964,6 +977,7 @@ impl Client {
         info: &Arc<MessageInfo>,
         sender_encryption_jid: &Jid,
         decrypt_fail_mode: crate::types::events::DecryptFailMode,
+        ack_recipient: Option<&Jid>,
         stanza_origin: raw_pending::StanzaOrigin,
     ) -> SessionBatchOutcome {
         // Decrypt and projection are sequential phases. Keeping their state in
@@ -974,6 +988,7 @@ impl Client {
                 info,
                 sender_encryption_jid,
                 decrypt_fail_mode,
+                ack_recipient,
                 stanza_origin,
             ));
             std::future::poll_fn(|cx| poll_inbound_phase(future.as_mut(), cx)).await
@@ -1043,6 +1058,7 @@ impl Client {
         info: &Arc<MessageInfo>,
         sender_encryption_jid: &Jid,
         decrypt_fail_mode: crate::types::events::DecryptFailMode,
+        ack_recipient: Option<&Jid>,
         stanza_origin: raw_pending::StanzaOrigin,
     ) -> (
         SessionBatchOutcome,
@@ -1448,6 +1464,7 @@ impl Client {
                                                     info,
                                                     RetryReason::InvalidKeyId,
                                                     decrypt_fail_mode,
+                                                    ack_recipient,
                                                 )
                                                 .await;
                                         }
@@ -1489,6 +1506,7 @@ impl Client {
                                             info,
                                             RetryReason::InvalidKey,
                                             decrypt_fail_mode,
+                                            ack_recipient,
                                         )
                                         .await;
                                 }
@@ -1569,7 +1587,12 @@ impl Client {
                             terminal.unwrap_or(EncDecryptFailureReason::NoSession),
                         );
                         outcome.undecryptable |= self
-                            .handle_decrypt_failure(info, RetryReason::NoSession, decrypt_fail_mode)
+                            .handle_decrypt_failure(
+                                info,
+                                RetryReason::NoSession,
+                                decrypt_fail_mode,
+                                ack_recipient,
+                            )
                             .await;
                         continue;
                     } else if matches!(
@@ -1648,7 +1671,7 @@ impl Client {
                             terminal.unwrap_or(failure),
                         );
                         outcome.undecryptable |= self
-                            .handle_decrypt_failure(info, reason, decrypt_fail_mode)
+                            .handle_decrypt_failure(info, reason, decrypt_fail_mode, ack_recipient)
                             .await;
                         continue;
                     } else if matches!(e, SignalProtocolError::InvalidPreKeyId) {
@@ -1715,6 +1738,7 @@ impl Client {
                                 info,
                                 RetryReason::InvalidKeyId,
                                 decrypt_fail_mode,
+                                ack_recipient,
                             )
                             .await;
                         continue;
@@ -1742,6 +1766,7 @@ impl Client {
                                 info,
                                 RetryReason::InvalidKeyId,
                                 decrypt_fail_mode,
+                                ack_recipient,
                             )
                             .await;
                         continue;
@@ -1795,6 +1820,7 @@ impl Client {
         info: &Arc<MessageInfo>,
         _sender_encryption_jid: &Jid,
         decrypt_fail_mode: crate::types::events::DecryptFailMode,
+        ack_recipient: Option<&Jid>,
         stanza_origin: raw_pending::StanzaOrigin,
     ) -> Result<(), DecryptionError> {
         if payloads.is_empty() {
@@ -1946,8 +1972,13 @@ impl Client {
                         self.handle_unknown_device_sync(info).await;
                     }
 
-                    self.handle_decrypt_failure(info, retry_reason, decrypt_fail_mode)
-                        .await;
+                    self.handle_decrypt_failure(
+                        info,
+                        retry_reason,
+                        decrypt_fail_mode,
+                        ack_recipient,
+                    )
+                    .await;
                 }
                 Err(e) => {
                     // Envelope and storage failures are named by the shared
@@ -1988,7 +2019,7 @@ impl Client {
                             sender_key_name.sender_id(),
                             e
                         );
-                        self.handle_decrypt_failure(info, reason, decrypt_fail_mode)
+                        self.handle_decrypt_failure(info, reason, decrypt_fail_mode, ack_recipient)
                             .await;
                         continue;
                     }
