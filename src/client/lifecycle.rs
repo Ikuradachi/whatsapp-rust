@@ -520,6 +520,12 @@ impl Client {
             lifecycle,
             #[cfg(feature = "plugins")]
             plugin_host,
+            inbound_durability_hook,
+            history_sync_capture_hook,
+            group_notification_durability_hook,
+            custom_enc_handlers,
+            retry_admission,
+            decrypt_failure_admission,
             noise_cert_policy,
             history_sync_admission,
             connect_admission,
@@ -735,12 +741,18 @@ impl Client {
             app_state_key_share_prepare_test_failures: AtomicU32::new(0),
             #[cfg(test)]
             chatstate_events_built: AtomicU32::new(0),
-            custom_enc_handlers: std::sync::OnceLock::new(),
-            inbound_durability_hook: std::sync::OnceLock::new(),
-            history_sync_capture_hook: std::sync::OnceLock::new(),
-            group_notification_durability_hook: std::sync::OnceLock::new(),
-            retry_admission: std::sync::OnceLock::new(),
-            decrypt_failure_admission: std::sync::OnceLock::new(),
+            custom_enc_handlers,
+            inbound_durability_hook: inbound_durability_hook
+                .map(std::sync::OnceLock::from)
+                .unwrap_or_default(),
+            history_sync_capture_hook: history_sync_capture_hook
+                .map(std::sync::OnceLock::from)
+                .unwrap_or_default(),
+            group_notification_durability_hook: group_notification_durability_hook
+                .map(std::sync::OnceLock::from)
+                .unwrap_or_default(),
+            retry_admission,
+            decrypt_failure_admission,
             history_sync_admission,
             connect_admission,
             chatstate_handler_count: Arc::new(AtomicUsize::new(0)),
@@ -1691,6 +1703,11 @@ impl Client {
 
     /// End this client's session for good: close the socket, stop the run
     /// loop, and flush what is still pending.
+    ///
+    /// The report covers SDK-owned inbound/outbound buffers and persistence.
+    /// Detached [`EncHandler`] tasks are
+    /// not joined or cancelled. Applications own their completion and can use
+    /// [`Self::shutdown_signal`] to coordinate it.
     ///
     /// Terminal, not a pause. The shutdown it fires is published once and for
     /// all, so afterwards [`run`](Self::run) returns immediately and
@@ -2925,6 +2942,7 @@ mod tests {
                     noise_cert_policy: wacore::handshake::NoiseCertPolicy::default(),
                     history_sync_admission: None,
                     connect_admission: None,
+                    ..Default::default()
                 },
             )
         };
