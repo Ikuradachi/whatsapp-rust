@@ -49,7 +49,7 @@ use super::rtp::{
 };
 use super::session::{
     CallDirection, MediaPipeline, MediaPipelineParams, SrtpReceiveError, VideoPipeline,
-    VideoPipelineParams,
+    VideoPipelineParams, VideoReassemblyStats,
 };
 use super::sframe::{SframeIn, SframeSession};
 use super::{ssrc, stun};
@@ -947,6 +947,65 @@ impl VideoPlaneState {
         };
         self.inbound_expected = Some((ssrc, sequence.wrapping_add(1)));
         missing
+    }
+}
+
+/// Add one packet's reassembly counters to the call's totals. Taken per packet rather than read from
+/// the pipeline at report time because the video plane can be rebuilt mid-call, and its counters
+/// with it.
+fn fold_video_reassembly(stats: &mut CallMediaStats, r: &VideoReassemblyStats) {
+    let d = &r.depacketizer;
+    for (total, delta) in [
+        (
+            &mut stats.video_access_units_completed,
+            d.access_units_completed,
+        ),
+        (
+            &mut stats.video_access_units_without_marker,
+            d.access_units_without_marker,
+        ),
+        (&mut stats.video_access_units_empty, d.access_units_empty),
+        (
+            &mut stats.video_access_units_evicted,
+            d.access_units_evicted,
+        ),
+        (
+            &mut stats.video_rtp_stale_timestamp,
+            d.packets_stale_timestamp,
+        ),
+        (
+            &mut stats.video_rtp_completed_timestamp,
+            d.packets_completed_timestamp,
+        ),
+        (
+            &mut stats.video_fu_dropped_sequence_gap,
+            d.fu_dropped_sequence_gap,
+        ),
+        (
+            &mut stats.video_fu_dropped_timestamp_boundary,
+            d.fu_dropped_timestamp_boundary,
+        ),
+        (
+            &mut stats.video_fu_dropped_unterminated,
+            d.fu_dropped_unterminated,
+        ),
+        (&mut stats.video_fu_orphan_fragments, d.fu_orphan_fragments),
+        (
+            &mut stats.video_nal_oversize_dropped,
+            d.nal_oversize_dropped,
+        ),
+        (&mut stats.video_payload_unusable, d.payload_unusable),
+        (&mut stats.video_ssrc_switches, r.ssrc_switches),
+        (
+            &mut stats.video_ssrc_switch_partial_dropped,
+            r.ssrc_switch_partial_dropped,
+        ),
+        (
+            &mut stats.video_retired_ssrc_ignored,
+            r.retired_ssrc_ignored,
+        ),
+    ] {
+        *total = total.saturating_add(delta);
     }
 }
 
@@ -2956,6 +3015,8 @@ impl CallEngine {
             let mut piggybacked = None;
             // Packets of the peer's picture that never arrived, acted on once the media borrow ends.
             let mut video_lost = 0u16;
+            // What reassembly did with the packet, folded in once the media borrow ends.
+            let mut reassembly = None;
             // The clear extension identifies an audio arrival even when its tag fails.
             // Pure video must not keep the audio watchdog alive.
             if audio_carrier {
@@ -2965,6 +3026,7 @@ impl CallEngine {
             let received = match m.video.as_mut() {
                 Some(v) if v.active => match v.pipe.unprotect_video_packet_split(pkt) {
                     Ok((header, completed, audio, received_payload_len)) => {
+                        reassembly = Some(v.pipe.take_reassembly_stats());
                         if v.pipe.inbound_ssrc() == Some(header.ssrc) {
                             v.reception.observe(
                                 header.ssrc,
@@ -3032,6 +3094,9 @@ impl CallEngine {
                     self.media_stats.srtp_unprotect_failed =
                         self.media_stats.srtp_unprotect_failed.saturating_add(1);
                 }
+            }
+            if let Some(reassembly) = reassembly {
+                fold_video_reassembly(&mut self.media_stats, &reassembly);
             }
             if let Some(audio) = piggybacked {
                 self.on_piggybacked_audio(now, &audio);
@@ -10366,6 +10431,44 @@ mod tests {
         for packet in peer.protect_video(&video_delta_au(100)) {
             eng.handle_input(now, Input::RelayPacket(&packet));
         }
+    }
+
+    // Reassembly's counters reach the call's stats, so a call whose packets arrived but whose
+    // pictures did not can say where they went.
+    #[test]
+    fn video_reassembly_counters_reach_media_stats() {
+        let (mut eng, mut peer) = video_engine_with_inbound_stream();
+        // The stream is already established, with its first picture through.
+        let before = eng.media_stats();
+        assert_eq!(before.video_access_units_completed, 1);
+        for packet in peer.protect_video(&video_delta_au(100)) {
+            eng.handle_input(200, Input::RelayPacket(&packet));
+        }
+        // A fragmented picture whose second packet is lost: the partial NAL is dropped, its later
+        // fragments are orphans, and the timestamp yields nothing.
+        let mut fragments = peer.protect_video(&video_delta_au(3_000));
+        assert!(fragments.len() > 3);
+        fragments.remove(1);
+        for packet in &fragments {
+            eng.handle_input(300, Input::RelayPacket(packet));
+        }
+        for packet in peer.protect_video(&video_delta_au(100)) {
+            eng.handle_input(400, Input::RelayPacket(&packet));
+        }
+
+        let stats = eng.media_stats();
+        assert_eq!(stats.video_rtp_lost, 1);
+        assert_eq!(stats.video_access_units_completed, 3);
+        assert_eq!(stats.video_fu_dropped_sequence_gap, 1);
+        assert_eq!(
+            stats.video_fu_orphan_fragments,
+            u32::try_from(fragments.len() - 1).unwrap()
+        );
+        assert_eq!(stats.video_access_units_empty, 1);
+        assert_eq!(stats.video_access_units_without_marker, 0);
+        assert_eq!(stats.video_ssrc_switches, 0);
+        let report = format!("{stats:?}");
+        assert!(report.contains("video_fu_dropped_sequence_gap: 1"));
     }
 
     #[test]
