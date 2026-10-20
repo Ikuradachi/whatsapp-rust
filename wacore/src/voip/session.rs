@@ -710,8 +710,13 @@ fn unprotect_srtp_packet_checked(
 /// reassembled from them on receive.
 type TimestampedAccessUnit = (u32, Vec<u8>, Option<u8>);
 type VideoPacketResult = (RtpHeader, Vec<TimestampedAccessUnit>);
-/// [`VideoPacketResult`] plus the audio packet the video packet carried piggybacked, if any.
-type VideoPacketSplit = (RtpHeader, Vec<TimestampedAccessUnit>, Option<Vec<u8>>);
+/// [`VideoPacketResult`], embedded audio if present, and authenticated payload bytes without padding.
+type VideoPacketSplit = (
+    RtpHeader,
+    Vec<TimestampedAccessUnit>,
+    Option<Vec<u8>>,
+    usize,
+);
 
 pub struct VideoPipeline {
     send_keys: E2eSrtpKeys,
@@ -1013,7 +1018,7 @@ impl VideoPipeline {
     pub(crate) fn unprotect_video_packet(&mut self, packet: &[u8]) -> Option<VideoPacketResult> {
         self.unprotect_video_packet_split(packet)
             .ok()
-            .map(|(header, completed, _)| (header, completed))
+            .map(|(header, completed, _, _)| (header, completed))
     }
 
     /// [`Self::unprotect_video_packet`], also handing back the audio packet the video packet
@@ -1036,6 +1041,7 @@ impl VideoPipeline {
             self.warp_mi_tag_len,
             packet,
         )?;
+        let payload_len = super::rtp::received_payload_len(packet, &payload);
         let piggybacked_audio = super::rtp::split_whatsapp_audio_piggyback(packet, &mut payload);
         // Counted BEFORE the grace check, and for every authenticated packet including the ones that
         // check ignores. Counting only the stream that replaced the retired one would never expire
@@ -1077,7 +1083,7 @@ impl VideoPipeline {
                 {
                     // Its picture is ignored, but the audio it carries is the peer's current
                     // audio: the audio stream does not change with the video SSRC.
-                    return Ok((header, Vec::new(), piggybacked_audio));
+                    return Ok((header, Vec::new(), piggybacked_audio, payload_len));
                 }
             }
             if self.depacketizer_ssrc.is_some() {
@@ -1128,7 +1134,7 @@ impl VideoPipeline {
             completed.push((timestamp, au, orientation));
             next = self.depacketizer.pop_ready();
         }
-        Ok((header, completed, piggybacked_audio))
+        Ok((header, completed, piggybacked_audio, payload_len))
     }
 }
 
