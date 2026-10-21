@@ -6,10 +6,14 @@
 //! Annex-B access units and receive reassembled ones. Pure, no-Tokio, wasm-safe.
 
 /// Largest RTP payload we emit before fragmenting a NAL into FU-A units.
-/// Matches the reference relay MTU budget used by live WhatsApp interop.
-pub const H264_SINGLE_NAL_MAX: usize = 800;
-/// FU-A fragment body size: `H264_SINGLE_NAL_MAX` minus indicator + FU header.
-const H264_FUA_FRAG_SIZE: usize = H264_SINGLE_NAL_MAX - 2;
+///
+/// WhatsApp's iOS sender fills FU-A payloads up to 960 bytes in a live call. With the 28-byte
+/// video RTP header, the 10-byte SRTP tag and a WARP MI tag of at most 20 bytes, such a packet is
+/// at most 1018 bytes, inside the 1163 bytes an SCTP DATA chunk can carry within the relay
+/// association's 1191-byte MTU, so no fragment is split again below RTP.
+pub const H264_SINGLE_NAL_MAX: usize = 960;
+/// Largest FU-A fragment body: `H264_SINGLE_NAL_MAX` minus indicator + FU header.
+const H264_FUA_FRAG_MAX: usize = H264_SINGLE_NAL_MAX - 2;
 /// Reassembly cap: a "NAL" that grows past this is garbage or an attack, not video.
 pub const H264_MAX_AU_BYTES: usize = 4 * 1024 * 1024;
 
@@ -366,12 +370,20 @@ fn packetize_au_inner(au: &[u8], out: &mut PacketizedAu, keep_sei: bool) {
 }
 
 /// Fragment one oversized NAL into an FU-A run (RFC 6184 section 5.8).
+///
+/// The run uses as few fragments as [`H264_FUA_FRAG_MAX`] allows, and splits the body evenly
+/// across them (sizes differ by at most one byte), as WhatsApp's own senders do. Filling every
+/// fragment to the limit instead leaves a short tail packet that costs a packet's overhead and a
+/// loss opportunity while carrying little of the NAL.
 fn fragment_nal(nal: &[u8], out: &mut PacketizedAu) {
     let indicator = (nal[0] & 0xe0) | NAL_TYPE_FU_A;
     let orig_type = nal[0] & 0x1f;
-    let body = &nal[1..];
-    let n_frags = body.len().div_ceil(H264_FUA_FRAG_SIZE);
-    for (i, chunk) in body.chunks(H264_FUA_FRAG_SIZE).enumerate() {
+    let mut body = &nal[1..];
+    let n_frags = body.len().div_ceil(H264_FUA_FRAG_MAX);
+    let (base, longer) = (body.len() / n_frags, body.len() % n_frags);
+    for i in 0..n_frags {
+        let (chunk, rest) = body.split_at(base + usize::from(i < longer));
+        body = rest;
         let mut fu_header = orig_type;
         if i == 0 {
             fu_header |= 0x80; // S
@@ -1018,8 +1030,8 @@ mod tests {
     /// pairs, so parameter sets stay packed even after a large prefix unit.
     #[test]
     fn stap_a_overflow_opens_a_new_aggregate() {
-        let sps = nal(7, 400);
-        let pps = nal(8, 400);
+        let sps = nal(7, 600);
+        let pps = nal(8, 600);
         let au = au_from_nals(&[sps.clone(), pps.clone(), nal(5, 60)]);
         let mut payloads = PacketizedAu::default();
         packetize_au(&au, &mut payloads);
@@ -1120,19 +1132,69 @@ mod tests {
     }
 
     #[test]
-    fn boundary_800_stays_single_and_801_fragments() {
+    fn boundary_960_stays_single_and_961_fragments() {
         let au = au_from_nals(&[nal(1, H264_SINGLE_NAL_MAX)]);
         let mut payloads = PacketizedAu::default();
         packetize_au(&au, &mut payloads);
-        assert_eq!(payloads.len(), 1, "800-byte NAL must not fragment");
+        assert_eq!(payloads.len(), 1, "960-byte NAL must not fragment");
 
         let au = au_from_nals(&[nal(1, H264_SINGLE_NAL_MAX + 1)]);
         packetize_au(&au, &mut payloads);
-        assert_eq!(payloads.len(), 2, "801-byte NAL must fragment");
+        assert_eq!(payloads.len(), 2, "961-byte NAL must fragment");
+        assert_eq!(
+            payloads.iter().map(<[u8]>::len).collect::<Vec<_>>(),
+            [482, 482],
+            "the two fragments share the body evenly"
+        );
         assert_eq!(nal_unit_type(&payloads[0]), NAL_TYPE_FU_A);
         assert_eq!(payloads[0][1] & 0x80, 0x80, "first fragment sets S");
         assert_eq!(payloads[1][1] & 0x40, 0x40, "last fragment sets E");
         assert_eq!(depacketize_all(payloads.iter()), Some(au));
+    }
+
+    /// The FU-A run takes as few fragments as the payload limit allows and splits the NAL body
+    /// evenly across them, rather than filling each to the limit and leaving a short tail.
+    #[test]
+    fn fua_fragments_split_the_nal_evenly() {
+        let mut payloads = PacketizedAu::default();
+        for (nal_len, sizes) in [
+            // 3000-byte body: four fragments of 750, not three of 958 and a 126-byte tail.
+            (3001, vec![752; 4]),
+            // A body of exactly two full fragments.
+            (1917, vec![960; 2]),
+            // One byte more needs a third fragment, and all three shrink to share it.
+            (1918, vec![641; 3]),
+            // 1001-byte body over two fragments: the odd byte goes to the first.
+            (1002, vec![503, 502]),
+        ] {
+            let au = au_from_nals(&[nal(5, nal_len)]);
+            packetize_au(&au, &mut payloads);
+            assert_eq!(
+                payloads.iter().map(<[u8]>::len).collect::<Vec<_>>(),
+                sizes,
+                "{nal_len}-byte NAL"
+            );
+            assert_eq!(depacketize_all(payloads.iter()), Some(au));
+        }
+    }
+
+    #[test]
+    fn fua_fragment_counts_and_sizes_hold_across_nal_lengths() {
+        let mut payloads = PacketizedAu::default();
+        for nal_len in (H264_SINGLE_NAL_MAX + 1..40_000).step_by(37) {
+            let au = au_from_nals(&[nal(1, nal_len)]);
+            packetize_au(&au, &mut payloads);
+            let sizes: Vec<usize> = payloads.iter().map(<[u8]>::len).collect();
+            assert_eq!(sizes.len(), (nal_len - 1).div_ceil(H264_FUA_FRAG_MAX));
+            let (min, max) = (sizes.iter().min().unwrap(), sizes.iter().max().unwrap());
+            assert!(*max <= H264_SINGLE_NAL_MAX, "{nal_len}: {sizes:?}");
+            assert!(max - min <= 1, "{nal_len}: uneven split {sizes:?}");
+            assert!(
+                sizes.windows(2).all(|w| w[0] >= w[1]),
+                "{nal_len}: longer fragments lead {sizes:?}"
+            );
+            assert_eq!(depacketize_all(payloads.iter()), Some(au), "{nal_len}");
+        }
     }
 
     #[test]
