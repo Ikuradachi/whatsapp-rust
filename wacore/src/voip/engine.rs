@@ -11310,6 +11310,7 @@ mod tests {
         let mut eng = CallEngine::new(cfg, Box::new(SequentialTxIds::new())).unwrap();
         eng.start(0, 0);
         let _ = drain(&mut eng);
+        allocate(&mut eng);
         eng.handle_input(1, Input::VideoFrame(&video_au(20_000)));
         let (video, fec) = split(&drain(&mut eng).0);
         assert!(video.len() >= 16, "a keyframe of several groups");
