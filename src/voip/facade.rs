@@ -45,7 +45,7 @@ use wacore::voip_control::{
     CallDirection, CallEvent, CallPhase, MediaAudioCodec as AudioCodec,
     MediaAudioFormat as AudioFormat, MediaAudioRtpProfile as AudioRtpProfile,
     MediaKeyframeUrgency as KeyframeUrgency, MediaVideoUpgradeToken as VideoUpgradeToken,
-    VideoFrame, VideoInput, VideoTeardownHook, VoipMediaSession,
+    VideoFecConfig, VideoFrame, VideoInput, VideoTeardownHook, VoipMediaSession,
 };
 use wacore_binary::{Jid, JidExt as _, Server};
 use waproto::whatsapp as wa;
@@ -4281,6 +4281,19 @@ impl CallHandle {
     pub fn request_peer_keyframe(&self, urgency: KeyframeUrgency) {
         self.video
             .send_control(VideoControl::RequestPeerKeyframe(urgency));
+    }
+
+    /// Set how much forward error correction our video carries, from the next access unit on.
+    ///
+    /// On by default in a 1:1 call, as WhatsApp's own clients send it: a peer that does not ask
+    /// for retransmissions (an iPhone) otherwise freezes on any lost packet until the next
+    /// keyframe. [`CallMediaStats::video_fec_bytes_sent`] counts what it adds on top of the
+    /// encoder's bitrate. **Does nothing in a group call**, which sends no FEC.
+    ///
+    /// [`CallMediaStats::video_fec_bytes_sent`]:
+    ///     wacore::voip_control::media_stats::CallMediaStats::video_fec_bytes_sent
+    pub fn set_video_fec(&self, config: VideoFecConfig) {
+        self.video.send_control(VideoControl::SetFec(config));
     }
 
     /// Send the standalone `<video state=1 dec="H264" device_orientation="0">` used after a

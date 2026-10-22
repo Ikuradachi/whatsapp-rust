@@ -22,6 +22,7 @@ use crate::time::Instant;
 use crate::voip::audio::EncodedAudioFrame;
 use crate::voip::demux::{RelayPacketKind, classify_relay_packet};
 use crate::voip::engine::{self, CallEngine, CallEvent, Input, KeyframeUrgency, Output};
+use crate::voip::fec::RTP_PAYLOAD_TYPE_VIDEO_FEC;
 use crate::voip::group_media::GroupMediaError;
 use crate::voip::h264::VideoFrame;
 use crate::voip::registry::force_send_call_event;
@@ -93,6 +94,9 @@ struct SendBatch {
     kind: SendBatchKind,
     started: bool,
     video_keyframe: bool,
+    /// The newest access unit queued, which FEC packets that follow it join: see
+    /// [`queue_transmit`].
+    repairable: bool,
 }
 
 impl SendBatch {
@@ -108,6 +112,7 @@ impl SendBatch {
             kind,
             started: false,
             video_keyframe: false,
+            repairable: false,
         }
     }
 
@@ -123,6 +128,7 @@ impl SendBatch {
             kind: SendBatchKind::Video,
             started: false,
             video_keyframe,
+            repairable: true,
         }
     }
 
@@ -133,6 +139,7 @@ impl SendBatch {
             kind: SendBatchKind::VideoRetransmission,
             started: false,
             video_keyframe: false,
+            repairable: false,
         }
     }
 }
@@ -565,6 +572,9 @@ fn enqueue_batch(
 
 /// Coalesce every PT-97 packet through the marker into one queue unit, so backpressure keeps or
 /// drops a complete H.264 access unit instead of silently truncating an IDR.
+///
+/// A video FEC packet joins the access unit it follows, in place: it leaves at the pacer's rate
+/// right behind the packets it repairs, and is dropped with them, since it repairs nothing alone.
 fn queue_transmit(
     queue: &mut VecDeque<SendBatch>,
     pending_video: &mut Vec<Bytes>,
@@ -572,10 +582,32 @@ fn queue_transmit(
     data: Bytes,
 ) -> DroppedMedia {
     if let Some(header) = parse_rtp_header(&data)
+        && header.payload_type == RTP_PAYLOAD_TYPE_VIDEO_FEC
+    {
+        if !pending_video.is_empty() {
+            pending_video.push(data);
+            return DroppedMedia::default();
+        }
+        if let Some(batch) = queue.back_mut().filter(|batch| batch.repairable) {
+            batch.bytes = batch.bytes.saturating_add(data.len());
+            batch.packets.push_back(data);
+            return DroppedMedia::default();
+        }
+        return DroppedMedia {
+            video_access_units: 0,
+            packets: 1,
+        };
+    }
+    if let Some(header) = parse_rtp_header(&data)
         && header.payload_type == RTP_PAYLOAD_TYPE_H264
     {
         pending_video.push(data);
         if header.marker {
+            // Only the access unit about to be queued may take the FEC that follows it. If the
+            // queue refuses it, an older one left at the back must not.
+            for batch in queue.iter_mut() {
+                batch.repairable = false;
+            }
             return enqueue_batch(
                 queue,
                 awaiting_video_keyframe,
@@ -1345,6 +1377,7 @@ async fn run_call_with_clock_and_wallclock(
                     Ok(VideoControl::SetTimestampStride(ts_stride)) => {
                         let _ = eng.set_video_timestamp_stride(ts_stride);
                     }
+                    Ok(VideoControl::SetFec(config)) => eng.set_video_fec(config),
                     Ok(VideoControl::Enable) => {
                         // False only for a control-only engine or a malformed stored callKey; the
                         // audio plane already validated the key, so treat it as a no-op not fatal.
@@ -2104,6 +2137,7 @@ mod tests {
             kind,
             started,
             video_keyframe: false,
+            repairable: false,
         };
 
         let mut downgrade_queue = VecDeque::from([
@@ -2157,6 +2191,7 @@ mod tests {
             kind: SendBatchKind::Video,
             started: false,
             video_keyframe: keyframe,
+            repairable: false,
         };
         let mut queue = VecDeque::from([video(false)]);
         let mut pending_video = vec![Bytes::from_static(b"fragment")];
@@ -3597,10 +3632,31 @@ mod tests {
             video[1].1, video[FRAGMENTS].1,
             "retransmit the original protected fragment"
         );
+        // The video's FEC is paced with it, each packet right behind the group it repairs: four
+        // for 32 fragments at the default one per eight.
+        let paced: Vec<_> = transport
+            .sent
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, p)| {
+                parse_rtp_header(p).is_some_and(|h| {
+                    h.payload_type == RTP_PAYLOAD_TYPE_H264
+                        || h.payload_type == RTP_PAYLOAD_TYPE_VIDEO_FEC
+                })
+            })
+            .cloned()
+            .collect();
+        assert_eq!(paced.len(), FRAGMENTS + 1 + 4);
+        for group in 0..4 {
+            let fec = parse_rtp_header(&paced[9 * group + 8].1).unwrap();
+            assert_eq!(fec.payload_type, RTP_PAYLOAD_TYPE_VIDEO_FEC);
+            assert_eq!(fec.sequence_number, group as u16 + 1);
+        }
         // At this small volume the 4 Mbit/s floor applies: each byte costs 2 us,
         // with a 40 ms burst allowance. Check dispatch times, not only packet count.
         let mut next_us = 0u64;
-        for (at, packet) in &video {
+        for (at, packet) in &paced {
             let expected = next_us.saturating_sub(40_000).div_ceil(1000);
             assert_eq!(*at, expected);
             next_us = next_us.max(at * 1000) + packet.len() as u64 * 2;

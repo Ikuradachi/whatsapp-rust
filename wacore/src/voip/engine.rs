@@ -33,6 +33,7 @@ use super::h264::{VideoFrame, au_has_idr, au_is_keyframe};
 use super::media_stats::{AudioHealthAlarm, AudioHealthWatch, CODEC_FLAP_LIMIT, CallMediaStats};
 // Re-exported for the engine's tests and for callers that name the silence reason from this module;
 // the type itself lives in the neutral contract.
+use super::fec::RTP_PAYLOAD_TYPE_VIDEO_FEC;
 pub use super::media_stats::AudioSilenceReason;
 #[cfg(feature = "voip-mlow")]
 use super::mlow;
@@ -54,6 +55,7 @@ use super::session::{
 use super::sframe::{SframeIn, SframeSession};
 use super::{ssrc, stun};
 use crate::types::group_call::{GroupCallRelay, GroupCallUpdate};
+use crate::voip_control::VideoFecConfig;
 use wacore_binary::Jid;
 use zeroize::Zeroize;
 
@@ -1150,6 +1152,8 @@ pub struct CallEngine {
     /// Peer device orientation (0..3, ×90°) from the last `<video device_orientation>`; stamped on
     /// every reassembled inbound AU so the sink can rotate.
     peer_video_orientation: u8,
+    /// Forward error correction for our video in a 1:1 call. Group calls send none.
+    video_fec: VideoFecConfig,
     /// Media counters and the audio-health watchdog. On the engine rather than `MediaState` so a
     /// call that never gets a media plane still reports zeroes instead of nothing.
     media_stats: CallMediaStats,
@@ -1317,6 +1321,7 @@ impl CallEngine {
             group: None,
             media,
             peer_video_orientation: 0,
+            video_fec: VideoFecConfig::default(),
             media_stats: CallMediaStats::default(),
             health: AudioHealthWatch::default(),
             outbox: VecDeque::new(),
@@ -2076,6 +2081,24 @@ impl CallEngine {
         video.keyframe_announced = true;
         self.outbox
             .push_back(Output::Event(CallEvent::VideoKeyframeNeeded));
+    }
+
+    /// How much forward error correction a 1:1 call sends with its video, from the next access
+    /// unit on. On by default ([`VideoFecConfig::default`]); a group call sends none whatever this
+    /// says. [`CallMediaStats::video_fec_bytes_sent`] counts what it costs.
+    pub fn set_video_fec(&mut self, config: VideoFecConfig) {
+        self.video_fec = config;
+    }
+
+    /// Video packets per FEC packet at the moment, or `None` while no FEC is sent.
+    pub fn video_fec_group_size(&self) -> Option<usize> {
+        if self.group.is_some() {
+            return None;
+        }
+        self.media
+            .as_ref()
+            .and_then(|m| m.video.as_ref())
+            .and_then(|v| v.pipe.fec_group_size())
     }
 
     /// Re-arm outbound H.264 recovery after the application switches camera/screen sources.
@@ -2895,6 +2918,16 @@ impl CallEngine {
             {
                 newly_needs_keyframe = true;
                 video.keyframe_required = true;
+            }
+            // How much of our video the peer reports lost sets how much FEC follows it.
+            if let Some(video_ssrc) = video_ssrc
+                && let Some(video) = m.video.as_mut()
+                && let Some(block) = summary
+                    .report_blocks
+                    .iter()
+                    .rfind(|block| block.ssrc == video_ssrc)
+            {
+                video.pipe.observe_send_loss(block.fraction_lost);
             }
             // The peer lost some of our video and asks for it again. Answered while video is on
             // the wire; a gated or downgraded plane has nothing it may send.
@@ -4186,6 +4219,22 @@ impl CallEngine {
         if v.keyframe_required && !au_has_idr(au) {
             return;
         }
+        // 1:1 only: a group call's media goes through an SFU, whose own FEC is hop by hop.
+        let fec = if self.group.is_none() {
+            self.video_fec
+        } else {
+            VideoFecConfig::disabled()
+        };
+        if fec.enabled || v.pipe.fec_ssrc().is_some() {
+            let fec_ssrc = v.pipe.fec_ssrc().unwrap_or_else(|| {
+                ssrc::derive_wasm_participant_ssrc(
+                    &self.call_id,
+                    &self.self_participant_id,
+                    ssrc::VIDEO_FEC_SSRC_SLOT_WORD,
+                )
+            });
+            v.pipe.configure_fec(fec_ssrc, fec);
+        }
         let packets = v.pipe.protect_video(au);
         if packets.is_empty() {
             return;
@@ -4197,7 +4246,18 @@ impl CallEngine {
         let answers_nacks = self.group.is_none();
         for packet in packets {
             let packet = Bytes::from(packet);
-            if answers_nacks {
+            // A repair packet is never asked for again: the peer NACKs video sequence numbers,
+            // and a lost repair packet is only worth what it could have repaired.
+            if packet
+                .get(1)
+                .is_some_and(|b| b & 0x7f == RTP_PAYLOAD_TYPE_VIDEO_FEC)
+            {
+                self.media_stats.video_fec_sent = self.media_stats.video_fec_sent.saturating_add(1);
+                self.media_stats.video_fec_bytes_sent = self
+                    .media_stats
+                    .video_fec_bytes_sent
+                    .saturating_add(packet.len() as u64);
+            } else if answers_nacks {
                 v.sent.record(&packet);
             }
             self.outbox.push_back(Output::Transmit(packet));
@@ -5054,6 +5114,32 @@ mod encoded_tests {
             Some(8),
             "the driver must be able to observe and purge on the send-key transition"
         );
+    }
+
+    #[test]
+    fn a_group_call_sends_no_video_fec() {
+        let mut engine = group_engine();
+        assert_eq!(
+            engine.apply_group_raw_epoch(7, &[0x42; 32]).unwrap(),
+            GroupEpochApply::Installed
+        );
+        engine.start(0, 1_700_000_000_000);
+        let _ = drain(&mut engine);
+        let mut idr = vec![0, 0, 0, 1, 0x65];
+        idr.extend(std::iter::repeat_n(0x55, 20_000));
+        engine.handle_input(1, Input::VideoFrame(&idr));
+        let outputs = drain(&mut engine);
+        let payload_types: Vec<u8> = outputs
+            .iter()
+            .filter_map(|output| match output {
+                Output::Transmit(packet) => parse_rtp_header(packet).map(|h| h.payload_type),
+                _ => None,
+            })
+            .collect();
+        assert!(payload_types.contains(&RTP_PAYLOAD_TYPE_H264));
+        assert!(!payload_types.contains(&RTP_PAYLOAD_TYPE_VIDEO_FEC));
+        assert_eq!(engine.video_fec_group_size(), None);
+        assert_eq!(engine.media_stats().video_fec_sent, 0);
     }
 
     #[test]
@@ -11184,6 +11270,116 @@ mod tests {
         assert!(video_packets(&drain(&mut eng).0).is_empty());
         assert_eq!(eng.media_stats().video_nack_requested, 9);
         assert_eq!(eng.media_stats().video_retransmitted, 4);
+    }
+
+    #[test]
+    fn a_one_to_one_call_sends_video_fec_on_its_own_stream_and_adapts_it_to_loss() {
+        use crate::voip::e2e_srtp::{derive_srtcp_keys, protect_srtcp};
+        use crate::voip::fec::RTP_PAYLOAD_TYPE_VIDEO_FEC;
+        use crate::voip::rtcp::RTCP_PT_RR;
+
+        let mut cfg = config(true);
+        cfg.enable_video = true;
+        let call_key = cfg.call_key.clone();
+        let self_id = ssrc::format_e2e_srtp_participant_id(&cfg.self_lid);
+        let video_ssrc = ssrc::derive_video_participant_ssrc(&cfg.call_id, &self_id);
+        let fec_ssrc = ssrc::derive_wasm_participant_ssrc(
+            &cfg.call_id,
+            &self_id,
+            ssrc::VIDEO_FEC_SSRC_SLOT_WORD,
+        );
+        let peer_ssrc = ssrc::derive_wasm_participant_ssrc(
+            &cfg.call_id,
+            &ssrc::format_e2e_srtp_participant_id(&cfg.peer_lid),
+            0,
+        );
+        let split = |outs: &[Output]| -> (Vec<Bytes>, Vec<Bytes>) {
+            outs.iter()
+                .filter_map(|output| match output {
+                    Output::Transmit(packet) => parse_rtp_header(packet)
+                        .filter(|h| {
+                            h.payload_type == RTP_PAYLOAD_TYPE_H264
+                                || h.payload_type == RTP_PAYLOAD_TYPE_VIDEO_FEC
+                        })
+                        .map(|_| packet.clone()),
+                    _ => None,
+                })
+                .partition(|packet| packet[1] & 0x7f == RTP_PAYLOAD_TYPE_H264)
+        };
+
+        let mut eng = CallEngine::new(cfg, Box::new(SequentialTxIds::new())).unwrap();
+        eng.start(0, 0);
+        let _ = drain(&mut eng);
+        eng.handle_input(1, Input::VideoFrame(&video_au(20_000)));
+        let (video, fec) = split(&drain(&mut eng).0);
+        assert!(video.len() >= 16, "a keyframe of several groups");
+        assert_eq!(fec.len(), video.len() / 8, "one per eight video packets");
+        assert_eq!(eng.video_fec_group_size(), Some(8));
+        for (index, packet) in fec.iter().enumerate() {
+            let header = parse_rtp_header(packet).unwrap();
+            assert_eq!(header.ssrc, fec_ssrc, "slot 3 of our participant id");
+            assert_eq!(header.sequence_number, index as u16 + 1);
+            assert!(header.marker);
+        }
+        let stats = eng.media_stats();
+        assert_eq!(stats.video_fec_sent as usize, fec.len());
+        assert_eq!(
+            stats.video_fec_bytes_sent,
+            fec.iter().map(|packet| packet.len() as u64).sum::<u64>()
+        );
+
+        // The peer reports a tenth of our video lost: FEC doubles.
+        let peer_keys = derive_srtcp_keys(&call_key, PEER_LID).unwrap();
+        let report = |fraction_lost: u8, index: u32| {
+            let mut rr = vec![0x81, RTCP_PT_RR, 0, 7];
+            rr.extend_from_slice(&peer_ssrc.to_be_bytes());
+            rr.extend_from_slice(&video_ssrc.to_be_bytes());
+            rr.extend_from_slice(&[fraction_lost, 0, 0, 3]);
+            rr.extend_from_slice(&[0; 16]);
+            protect_srtcp(&peer_keys, peer_ssrc, index, &rr)
+        };
+        eng.handle_input(2, Input::RelayPacket(&report(26, 1)));
+        let _ = drain(&mut eng);
+        assert_eq!(eng.video_fec_group_size(), Some(4));
+        eng.handle_input(3, Input::VideoFrame(&video_delta_au(20_000)));
+        let (video, fec) = split(&drain(&mut eng).0);
+        assert_eq!(fec.len(), video.len() / 4);
+        eng.handle_input(4, Input::RelayPacket(&report(0, 2)));
+        let _ = drain(&mut eng);
+        assert_eq!(eng.video_fec_group_size(), Some(8));
+
+        // Repair packets are kept out of the retransmission store, which NACKs index by video
+        // sequence number.
+        let held = &eng
+            .media
+            .as_ref()
+            .unwrap()
+            .video
+            .as_ref()
+            .unwrap()
+            .sent
+            .packets;
+        assert!(!held.is_empty());
+        assert!(
+            held.iter()
+                .all(|(_, packet, _)| packet[1] & 0x7f == RTP_PAYLOAD_TYPE_H264)
+        );
+
+        // Turned off, it stops with the next access unit, and the stream does not restart.
+        eng.set_video_fec(VideoFecConfig::disabled());
+        eng.handle_input(5, Input::VideoFrame(&video_delta_au(20_000)));
+        let (video, fec) = split(&drain(&mut eng).0);
+        assert!(!video.is_empty());
+        assert!(fec.is_empty());
+        assert_eq!(eng.video_fec_group_size(), None);
+        eng.set_video_fec(VideoFecConfig::default());
+        eng.handle_input(6, Input::VideoFrame(&video_delta_au(20_000)));
+        let (_, fec) = split(&drain(&mut eng).0);
+        let first = parse_rtp_header(fec.first().unwrap()).unwrap();
+        assert!(
+            first.sequence_number > 1,
+            "sequence numbers continue under the same keys"
+        );
     }
 
     #[test]

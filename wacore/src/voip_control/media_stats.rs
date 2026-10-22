@@ -432,6 +432,10 @@ fn window_delta(now: &CallMediaStats, then: &CallMediaStats) -> CallMediaStats {
         video_retired_ssrc_ignored: now
             .video_retired_ssrc_ignored
             .saturating_sub(then.video_retired_ssrc_ignored),
+        video_fec_sent: now.video_fec_sent.saturating_sub(then.video_fec_sent),
+        video_fec_bytes_sent: now
+            .video_fec_bytes_sent
+            .saturating_sub(then.video_fec_bytes_sent),
     }
 }
 

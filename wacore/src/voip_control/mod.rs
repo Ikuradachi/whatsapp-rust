@@ -173,6 +173,48 @@ pub enum MediaKeyframeUrgency {
     Immediate,
 }
 
+/// How much forward error correction a 1:1 call sends with its video.
+///
+/// One FEC packet per group of video packets lets the peer rebuild any one packet of the group it
+/// lost, without asking for a retransmission or a keyframe. WhatsApp's own clients send it, and a
+/// receiver that never NACKs (an iPhone) depends on it: without it, any lost packet freezes the
+/// picture until the next keyframe.
+///
+/// A group is `clean_group` video packets while the peer's RTCP reports at most
+/// `loss_threshold` of our video lost, and `lossy_group` once it reports more. Both are clamped
+/// to 2..=8 packets: at least two, so FEC never exceeds half the video packets, and at most eight,
+/// so a group ends near a frame boundary without growing past one 15-packet mask.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, bon::Builder)]
+#[non_exhaustive]
+pub struct VideoFecConfig {
+    /// Whether FEC is sent at all.
+    #[builder(default = true)]
+    pub enabled: bool,
+    /// Video packets per FEC packet on a clean path.
+    #[builder(default = 8)]
+    pub clean_group: u8,
+    /// Video packets per FEC packet while the peer reports loss above `loss_threshold`.
+    #[builder(default = 4)]
+    pub lossy_group: u8,
+    /// The RTCP fraction lost (in 256ths) above which `lossy_group` applies. 5 is about 2%.
+    #[builder(default = 5)]
+    pub loss_threshold: u8,
+}
+
+impl Default for VideoFecConfig {
+    fn default() -> Self {
+        Self::builder().build()
+    }
+}
+
+impl VideoFecConfig {
+    /// No FEC.
+    #[must_use]
+    pub fn disabled() -> Self {
+        Self::builder().enabled(false).build()
+    }
+}
+
 /// Identity of one peer video-upgrade request. Replaces the engine's `VideoUpgradeToken`, whose
 /// fields are private, by a neutral `(generation, epoch)` pair an implementation can build and
 /// compare. Both fields are needed: `epoch` is what distinguishes two requests in one generation.
@@ -410,6 +452,8 @@ pub enum MediaCommand {
     SetVideoInputGeneration(u64),
     /// RTP clock increment per access unit.
     SetVideoTimestampStride(u32),
+    /// How much forward error correction our video carries in a 1:1 call.
+    SetVideoFec(VideoFecConfig),
     /// Caller-only: rekey the recv path to the device that answered, and apply the audio codec its
     /// capability selected in the same step. The two travel together because rekeying decides which
     /// keys decrypt the next packet, and the codec decides how it is decoded.
@@ -636,6 +680,14 @@ pub struct MediaStats {
     /// while the switch settles. Their piggybacked audio is still played.
     #[builder(default)]
     pub video_retired_ssrc_ignored: u32,
+    /// Video FEC packets we sent (see [`VideoFecConfig`]). Not kept for retransmission.
+    #[builder(default)]
+    pub video_fec_sent: u32,
+    /// Bytes of those packets as they went to the relay, RTP header and SRTP tag included. Their
+    /// rate is what FEC adds on top of the encoder's video, so an application holding the call to a
+    /// total budget can take it out of the encoder's target.
+    #[builder(default)]
+    pub video_fec_bytes_sent: u64,
 }
 
 impl MediaStats {

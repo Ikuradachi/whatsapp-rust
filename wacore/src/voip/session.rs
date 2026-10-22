@@ -7,6 +7,7 @@ use super::e2e_srtp::{
     crypt_payload_in_place, derive_e2e_keys, derive_e2e_keys_from_raw, derive_srtcp_keys,
     derive_srtcp_keys_from_raw, protect_srtcp, unprotect_srtcp, verify_warp_mi_tag,
 };
+use super::fec::{RTP_PAYLOAD_TYPE_VIDEO_FEC, VideoFecSender};
 use super::h264::{
     H264_MAX_AU_BYTES, H264Depacketizer, H264DepacketizerStats, PacketizedAu, au_has_idr,
     packetize_au,
@@ -19,10 +20,11 @@ use super::rtcp::{
 };
 use super::rtp::{
     RTP_FIXED_HEADER_LEN, RtpHeader, RtpStream, VIDEO_MEDIA_FRAME_INFO_DELTA,
-    VIDEO_MEDIA_FRAME_INFO_IDR, VideoRtpStream, encode_rtp_header_into, parse_rtp_header,
-    rtp_header_byte_length,
+    VIDEO_MEDIA_FRAME_INFO_IDR, VideoRtpStream, WHATSAPP_RTP_EXTENSION_PROFILE,
+    encode_rtp_header_into, parse_rtp_header, rtp_header_byte_length,
 };
 use super::ssrc::format_e2e_srtp_participant_id;
+use crate::voip_control::VideoFecConfig;
 
 // Call identity and lifecycle now live in the neutral contract, because the call flow must name a
 // session with the engine off. Re-exported here so `crate::voip::session::{CallSession, ...}` and
@@ -783,6 +785,77 @@ pub struct VideoPipeline {
     retired_ssrc_ignored: u32,
     pkt_scratch: PacketizedAu,
     srtcp: SrtcpSender,
+    /// Forward error correction for our video, once the call turns it on.
+    fec: Option<VideoFecStream>,
+}
+
+/// Our video's FEC stream: an SSRC, sequence numbers and rollover counter of its own, under the
+/// video's send keys, which the peer authenticates every one of our streams with.
+struct VideoFecStream {
+    sender: VideoFecSender,
+    ssrc: u32,
+    seq: u16,
+    roc: RocTracker,
+    /// The plaintext of the video packet being protected, reused across packets.
+    plain: Vec<u8>,
+}
+
+impl VideoFecStream {
+    fn new(ssrc: u32, config: VideoFecConfig) -> Self {
+        Self {
+            sender: VideoFecSender::new(config),
+            ssrc,
+            // As the peer's own FEC streams number theirs.
+            seq: 1,
+            roc: RocTracker::default(),
+            plain: Vec::new(),
+        }
+    }
+
+    /// One repair packet, protected, for the group `last` (a video packet's header) closed.
+    ///
+    /// It carries the last protected packet's RTP timestamp and always the marker, as WhatsApp's
+    /// clients send theirs, and the same header extension as that packet minus its frame
+    /// information, which describes a picture and this packet is not one.
+    fn protect(
+        &mut self,
+        keys: &E2eSrtpKeys,
+        warp_mi_tag_len: usize,
+        last: &RtpHeader,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let seq = self.seq;
+        self.seq = self.seq.wrapping_add(1);
+        let roc = self.roc.advance(seq);
+        let mut packet = Vec::with_capacity(28 + payload.len() + warp_mi_tag_len);
+        packet.push(
+            0x80 | if last.video_extension.is_some() {
+                0x10
+            } else {
+                0
+            },
+        );
+        packet.push(0x80 | RTP_PAYLOAD_TYPE_VIDEO_FEC);
+        packet.extend_from_slice(&seq.to_be_bytes());
+        packet.extend_from_slice(&last.timestamp.to_be_bytes());
+        packet.extend_from_slice(&self.ssrc.to_be_bytes());
+        if let Some(extension) = last.video_extension {
+            packet.extend_from_slice(&WHATSAPP_RTP_EXTENSION_PROFILE.to_be_bytes());
+            packet.extend_from_slice(&3u16.to_be_bytes());
+            packet.push(0x51);
+            packet.extend_from_slice(&extension.initial_bandwidth.to_be_bytes());
+            packet.push(0x61);
+            packet.extend_from_slice(&extension.short_offset.to_be_bytes());
+            packet.push(0x91);
+            packet.extend_from_slice(&extension.transport_sequence.to_be_bytes());
+            packet.extend_from_slice(&[0; 3]);
+        }
+        let start = packet.len();
+        packet.extend_from_slice(payload);
+        crypt_payload_in_place(keys, self.ssrc, seq, roc, &mut packet[start..]);
+        append_warp_mi_tag_in_place(&keys.auth_key, &mut packet, roc, warp_mi_tag_len);
+        packet
+    }
 }
 
 /// Borrowed inputs for [`VideoPipeline::new`]. No `samples_per_packet`: the
@@ -835,7 +908,39 @@ impl VideoPipeline {
             retired_ssrc_ignored: 0,
             pkt_scratch: PacketizedAu::default(),
             srtcp: SrtcpSender::new(p.call_key, p.self_lid, rtcp_cname, true)?,
+            fec: None,
         })
+    }
+
+    /// Send forward error correction with our video on `ssrc`, configured by `config`. Called
+    /// again it changes the configuration only: the stream keeps its SSRC, sequence numbers and
+    /// rollover counter, which must never repeat under the same keys.
+    pub(crate) fn configure_fec(&mut self, ssrc: u32, config: VideoFecConfig) {
+        match self.fec.as_mut() {
+            Some(fec) => fec.sender.set_config(config),
+            None => self.fec = Some(VideoFecStream::new(ssrc, config)),
+        }
+    }
+
+    /// The SSRC our video FEC goes out on, once FEC has been configured.
+    pub fn fec_ssrc(&self) -> Option<u32> {
+        self.fec.as_ref().map(|fec| fec.ssrc)
+    }
+
+    /// The fraction (in 256ths) of our video the peer's latest RTCP report says it lost, which
+    /// picks how much FEC follows it.
+    pub(crate) fn observe_send_loss(&mut self, fraction_lost: u8) {
+        if let Some(fec) = self.fec.as_mut() {
+            fec.sender.observe_loss(fraction_lost);
+        }
+    }
+
+    /// Video packets per FEC packet at the moment, or `None` while no FEC is sent.
+    pub fn fec_group_size(&self) -> Option<usize> {
+        self.fec
+            .as_ref()
+            .filter(|fec| fec.sender.enabled())
+            .map(|fec| fec.sender.group_size())
     }
 
     /// An SRTCP-protected Sender Report for the video stream.
@@ -985,6 +1090,10 @@ impl VideoPipeline {
     }
 
     /// Outbound: packetize one Annex-B access unit and protect each RTP packet.
+    ///
+    /// With FEC configured the result also holds repair packets, payload type
+    /// [`RTP_PAYLOAD_TYPE_VIDEO_FEC`] on the FEC SSRC, each right behind the video packet that
+    /// closes its group.
     pub fn protect_video(&mut self, au: &[u8]) -> Vec<Vec<u8>> {
         if au.len() > H264_MAX_AU_BYTES {
             return Vec::new();
@@ -999,6 +1108,10 @@ impl VideoPipeline {
             VIDEO_MEDIA_FRAME_INFO_DELTA
         };
         let mut packets = Vec::with_capacity(payloads.len());
+        let mut fec = self.fec.as_mut().filter(|fec| fec.sender.enabled());
+        if let Some(fec) = fec.as_mut() {
+            fec.sender.begin_access_unit(payloads.len());
+        }
         let last = payloads.len().saturating_sub(1);
         for (i, payload) in payloads.iter().enumerate() {
             let header = self.rtp.next_video_packet(i == last, media_frame_info);
@@ -1011,6 +1124,21 @@ impl VideoPipeline {
                 self.warp_mi_tag_len,
                 payload,
             ));
+            // The repair packet goes right behind the packet that closes its group, so it reaches
+            // the peer while the picture it can repair is still being assembled.
+            if let Some(fec) = fec.as_mut() {
+                fec.plain.clear();
+                encode_rtp_header_into(&header, &mut fec.plain);
+                fec.plain.extend_from_slice(payload);
+                if let Some(repair) = fec.sender.push(&fec.plain) {
+                    packets.push(fec.protect(
+                        &self.send_keys,
+                        self.warp_mi_tag_len,
+                        &header,
+                        &repair,
+                    ));
+                }
+            }
         }
         self.pkt_scratch = payloads;
         packets
@@ -1682,6 +1810,101 @@ mod tests {
         assert!(VideoPipeline::new(&video(0)).is_none());
         assert!(VideoPipeline::new(&video(WARP_MI_TAG_LEN)).is_some());
         assert!(VideoPipeline::new(&video(20)).is_some());
+    }
+
+    // Our video FEC authenticates under the keys the peer reads all our streams with, on its own
+    // stream, and what it carries rebuilds a lost video packet exactly as it was protected.
+    #[test]
+    fn video_fec_authenticates_on_its_own_stream_and_rebuilds_a_lost_packet() {
+        use crate::voip::fec::{FecHeader, recover_packet};
+
+        let call_key: Vec<u8> = (0u8..32).collect();
+        let me = "111111111111111:0@lid";
+        let peer = "222222222222222:0@lid";
+        let fec_ssrc = 0x0bad_f00d;
+        let mut tx = VideoPipeline::new(&video_params(&call_key, me, peer)).unwrap();
+        tx.configure_fec(fec_ssrc, VideoFecConfig::default());
+        assert_eq!(tx.fec_ssrc(), Some(fec_ssrc));
+        // The peer's side: its audio pipeline reads our auxiliary streams, its video ours.
+        let mut rx_media = MediaPipeline::new(&MediaPipelineParams {
+            call_key: &call_key,
+            self_lid: peer,
+            peer_lid: me,
+            ssrc: 0x0102_0304,
+            samples_per_packet: 960,
+            warp_mi_tag_len: WARP_MI_TAG_LEN,
+        })
+        .unwrap();
+        let mut rx_video = VideoPipeline::new(&video_params(&call_key, peer, me)).unwrap();
+
+        let packets = tx.protect_video(&video_au(20_000));
+        let mut plaintexts = Vec::new();
+        let mut repairs = Vec::new();
+        for packet in &packets {
+            if packet[1] & 0x7f == RTP_PAYLOAD_TYPE_VIDEO_FEC {
+                let (header, payload) = rx_media
+                    .unprotect_auxiliary(packet)
+                    .expect("FEC authenticates under our send keys");
+                assert_eq!(header.ssrc, fec_ssrc);
+                assert!(header.marker);
+                assert_eq!(
+                    Some(header.timestamp),
+                    plaintexts
+                        .last()
+                        .map(|p: &Vec<u8>| parse_rtp_header(p).unwrap().timestamp),
+                    "the timestamp of the packet it follows"
+                );
+                assert_eq!(
+                    rtp_header_byte_length(packet),
+                    Some(28),
+                    "the video's header extension, as WhatsApp's FEC carries it"
+                );
+                repairs.push(payload);
+            } else {
+                let (_, payload) = rx_video
+                    .unprotect_without_picture(packet)
+                    .expect("video authenticates");
+                let header_len = rtp_header_byte_length(packet).unwrap();
+                let mut plain = packet[..header_len].to_vec();
+                plain.extend_from_slice(&payload);
+                plaintexts.push(plain);
+            }
+        }
+        assert_eq!(repairs.len(), plaintexts.len() / 8);
+        assert!(repairs.len() >= 2);
+        let mut next = 0usize;
+        for (index, repair) in repairs.iter().enumerate() {
+            let (header, _) = FecHeader::parse(repair).unwrap();
+            assert_eq!(header.protected_ssrc, tx.send_ssrc());
+            let group: Vec<&Vec<u8>> = plaintexts[next..]
+                .iter()
+                .take_while(|p| {
+                    header
+                        .protected()
+                        .any(|seq| seq == parse_rtp_header(p).unwrap().sequence_number)
+                })
+                .collect();
+            assert_eq!(group.len(), header.protected().count());
+            next += group.len();
+            // Lose a different packet of each group.
+            let lost = index % group.len();
+            let received: Vec<&[u8]> = group
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != lost)
+                .map(|(_, p)| p.as_slice())
+                .collect();
+            assert_eq!(
+                recover_packet(repair, &received).as_deref(),
+                Some(group[lost].as_slice()),
+                "group {index}"
+            );
+        }
+        assert_eq!(
+            next,
+            plaintexts.len(),
+            "every video packet is protected once"
+        );
     }
 
     #[test]
