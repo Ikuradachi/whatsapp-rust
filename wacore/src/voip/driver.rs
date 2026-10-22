@@ -1597,10 +1597,26 @@ mod tests {
     #[derive(Default)]
     struct RecordingTransport {
         sent: Mutex<Vec<Bytes>>,
+        /// Where to answer an Allocate as a relay does, for a test whose video must go out.
+        allocate_answers: Option<async_channel::Sender<RelayTransportEvent>>,
     }
     #[async_trait]
     impl RelayTransport for RecordingTransport {
         async fn send(&self, data: Bytes) -> anyhow::Result<()> {
+            if let Some(answers) = &self.allocate_answers
+                && stun::stun_message_type(&data) == Some(stun::MSG_ALLOCATE_REQUEST)
+                && let Some(transaction_id) = stun::stun_transaction_id(&data)
+                && let Ok(transaction_id) = <[u8; 12]>::try_from(transaction_id)
+            {
+                let ok = stun::encode_stun_request(
+                    stun::MSG_ALLOCATE_SUCCESS,
+                    &transaction_id,
+                    &[],
+                    None,
+                    false,
+                );
+                let _ = answers.try_send(RelayTransportEvent::PacketReceived(Bytes::from(ok)));
+            }
             self.sent.lock().unwrap().push(data);
             Ok(())
         }
@@ -3222,7 +3238,10 @@ mod tests {
             relay_tx: relay_tx.clone(),
             horizon_ms: 5_000,
         });
-        let transport = Arc::new(RecordingTransport::default());
+        let transport = Arc::new(RecordingTransport {
+            allocate_answers: Some(relay_tx.clone()),
+            ..RecordingTransport::default()
+        });
         let cfg = config();
 
         // Mirrored peer video pipe (its self LID = our peer LID).
@@ -3460,6 +3479,22 @@ mod tests {
             async fn send(&self, packet: Bytes) -> anyhow::Result<()> {
                 let video = parse_rtp_header(&packet)
                     .is_some_and(|h| h.payload_type == RTP_PAYLOAD_TYPE_H264);
+                // The relay answers the Allocate: our video waits for it.
+                if stun::stun_message_type(&packet) == Some(stun::MSG_ALLOCATE_REQUEST) {
+                    let transaction_id: [u8; 12] = stun::stun_transaction_id(&packet)
+                        .and_then(|id| id.try_into().ok())
+                        .expect("STUN transaction IDs are 12 bytes");
+                    let ok = stun::encode_stun_request(
+                        stun::MSG_ALLOCATE_SUCCESS,
+                        &transaction_id,
+                        &[],
+                        None,
+                        false,
+                    );
+                    self.events
+                        .try_send(RelayTransportEvent::PacketReceived(Bytes::from(ok)))
+                        .unwrap();
+                }
                 self.sent
                     .lock()
                     .unwrap()

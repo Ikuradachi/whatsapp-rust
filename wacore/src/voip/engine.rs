@@ -2975,6 +2975,11 @@ impl CallEngine {
             if !was_allocated {
                 self.outbox
                     .push_back(Output::Event(CallEvent::RelayAllocated));
+                // Our video can go out from here on; the keyframe it starts with is asked for now,
+                // as the one the encoder may have made already was dropped with the stale queue.
+                if self.group.is_none() {
+                    self.announce_video_keyframe();
+                }
                 if self.media.is_some() {
                     self.rtcp_deadline = now + RTCP_MS;
                     // Inbound media only becomes possible here, so this is the earliest instant at
@@ -4149,6 +4154,20 @@ impl CallEngine {
                 && video.keyframe_required
                 && au_has_idr(au)
             {
+                video.keyframe_announced = false;
+            }
+            return;
+        }
+        if self.group.is_none() && !self.allocated {
+            // Video that reaches us before the relay has allocated was captured before the call's
+            // media could carry it: the application's encoder starts with the call, the drive loop
+            // only once the relay channel is open, and what the encoder made in between waits in
+            // the input queue. Sent now, seconds of stale pictures leave in one burst the moment
+            // media comes up. They are dropped instead, and the picture starts over from a fresh
+            // keyframe, asked for once the relay allocates: whatever comes next refers to a
+            // picture the peer never got.
+            if let Some(video) = self.media.as_mut().and_then(|media| media.video.as_mut()) {
+                video.keyframe_required = true;
                 video.keyframe_announced = false;
             }
             return;
@@ -7784,6 +7803,13 @@ mod tests {
         .unwrap()
     }
 
+    /// Answer the engine's Allocate, as the relay does before any of our video may go out.
+    fn allocate(eng: &mut CallEngine) {
+        let success = allocate_success(eng);
+        eng.handle_input(0, Input::RelayPacket(&success));
+        let _ = drain(eng);
+    }
+
     /// Started, allocated, and with the health watchdog armed: the state a live call is in.
     fn allocated_engine() -> CallEngine {
         let mut eng = engine(true);
@@ -11010,6 +11036,7 @@ mod tests {
         let mut eng = CallEngine::new(cfg, Box::new(SequentialTxIds::new())).unwrap();
         eng.start(0, 0);
         let _ = drain(&mut eng);
+        allocate(&mut eng);
         eng.handle_input(1, Input::RelayPacket(&protected));
         let (outs, _) = drain(&mut eng);
         assert!(outs.iter().any(|output| matches!(
@@ -11113,6 +11140,7 @@ mod tests {
         let mut eng = CallEngine::new(cfg, Box::new(SequentialTxIds::new())).unwrap();
         eng.start(0, 0);
         let _ = drain(&mut eng);
+        allocate(&mut eng);
         eng.handle_input(1, Input::VideoFrame(&video_au(4000)));
         let sent = video_packets(&drain(&mut eng).0);
         assert!(sent.len() >= 4, "the keyframe spans several packets");
@@ -11561,6 +11589,39 @@ mod tests {
         );
     }
 
+    // The application's encoder starts with the call and the drive loop only once the relay
+    // channel is open, so the first video the engine sees was captured before media could carry
+    // it. A real call sent nine such frames in a third of a millisecond, a keyframe among them.
+    #[test]
+    fn video_queued_before_the_relay_allocates_is_dropped_for_a_fresh_keyframe() {
+        let mut cfg = config(true);
+        cfg.enable_video = true;
+        let mut eng = CallEngine::new(cfg, Box::new(SequentialTxIds::new())).unwrap();
+        eng.start(0, 0);
+        let _ = drain(&mut eng);
+        eng.handle_input(1, Input::VideoFrame(&video_au(3000)));
+        eng.handle_input(1, Input::VideoFrame(&video_delta_au(300)));
+        let (outs, _) = drain(&mut eng);
+        assert_eq!(count_transmits(&outs), 0, "nothing before the allocation");
+
+        let success = allocate_success(&eng);
+        eng.handle_input(2, Input::RelayPacket(&success));
+        let (outs, _) = drain(&mut eng);
+        assert!(
+            outs.iter()
+                .any(|output| matches!(output, Output::Event(CallEvent::VideoKeyframeNeeded))),
+            "the dropped keyframe is asked for again"
+        );
+        eng.handle_input(3, Input::VideoFrame(&video_delta_au(300)));
+        assert_eq!(
+            count_transmits(&drain(&mut eng).0),
+            0,
+            "a delta cannot start the picture"
+        );
+        eng.handle_input(4, Input::VideoFrame(&video_au(3000)));
+        assert!(count_transmits(&drain(&mut eng).0) > 0);
+    }
+
     #[test]
     fn video_from_start_transmits_pt97_packets() {
         let mut cfg = config(true);
@@ -11569,6 +11630,7 @@ mod tests {
         assert!(eng.is_video_enabled());
         eng.start(0, 0);
         let _ = drain(&mut eng);
+        allocate(&mut eng);
         eng.handle_input(1, Input::VideoFrame(&video_delta_au(300)));
         assert_eq!(
             count_transmits(&drain(&mut eng).0),
@@ -11601,6 +11663,7 @@ mod tests {
         let mut eng = CallEngine::new(cfg, Box::new(SequentialTxIds::new())).unwrap();
         eng.start(0, 0);
         let _ = drain(&mut eng);
+        allocate(&mut eng);
 
         eng.handle_input(1, Input::VideoFrame(&video_au(100)));
         assert_eq!(count_transmits(&drain(&mut eng).0), 1);
@@ -11627,6 +11690,7 @@ mod tests {
         let mut eng = engine(true);
         eng.start(0, 0);
         let _ = drain(&mut eng);
+        allocate(&mut eng);
         let au = video_au(200);
         // Off: dropped.
         eng.handle_input(1, Input::VideoFrame(&au));
@@ -11661,6 +11725,7 @@ mod tests {
         assert!(eng.enable_video());
         eng.start(0, 0);
         let _ = drain(&mut eng);
+        allocate(&mut eng);
 
         let seq_of = |outs: &[Output]| -> Vec<u16> {
             outs.iter()
@@ -11702,6 +11767,7 @@ mod tests {
         assert!(eng.enable_video());
         eng.start(0, 0);
         let _ = drain(&mut eng);
+        allocate(&mut eng);
 
         let oversized = video_au(crate::voip::h264::H264_MAX_AU_BYTES);
         eng.handle_input(1, Input::VideoFrame(&oversized));
@@ -11727,6 +11793,7 @@ mod tests {
         assert!(eng.is_video_enabled(), "a gated plane is still 'enabled'");
         eng.start(0, 0);
         let _ = drain(&mut eng);
+        allocate(&mut eng);
 
         // Gated: local AUs are dropped (no PT-97 on the wire).
         eng.handle_input(1, Input::VideoFrame(&video_au(200)));
